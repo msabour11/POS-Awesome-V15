@@ -9,6 +9,7 @@ import {
 type SelectorLayoutOptions = {
 	resizeDebounce?: number;
 	loadVisibleItems?: () => void;
+	posProfile?: () => Record<string, any> | null | undefined;
 };
 
 /**
@@ -19,6 +20,7 @@ export function useItemSelectorLayout(options: SelectorLayoutOptions = {}) {
 	const {
 		resizeDebounce = 100,
 		loadVisibleItems, // Method to load more items on scroll (pagination)
+		posProfile,
 	} = options;
 
 	// State
@@ -27,8 +29,17 @@ export function useItemSelectorLayout(options: SelectorLayoutOptions = {}) {
 	const itemsContainerRef = ref<any>(null);
 	const scrollThrottle = ref<number | null>(null);
 
+	const currentPosProfile = computed(() => {
+		if (typeof posProfile === "function") {
+			return posProfile();
+		}
+		return null;
+	});
+
 	// Computed Metrics
-	const cardColumns = computed(() => getCardColumns(windowWidth.value));
+	const cardColumns = computed(() =>
+		getCardColumns(windowWidth.value, currentPosProfile.value),
+	);
 	const cardGap = computed(() => getCardGap(windowWidth.value));
 	const cardPadding = computed(() => getCardPadding(windowWidth.value));
 

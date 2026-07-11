@@ -156,7 +156,7 @@
 						@click="emitAddSelected"
 						class="px-6"
 					>
-					{{ __('Add Selected') }} ({{ selectedItems.size }})
+						{{ __("Add Selected") }} ({{ selectedItems.size }})
 					</v-btn>
 				</div>
 			</v-expand-transition>
@@ -626,6 +626,7 @@ const {
 } = useItemSelectorLayout({
 	resizeDebounce: 100,
 	loadVisibleItems: () => itemsLoader.loadVisibleItems(),
+	posProfile: () => pos_profile.value,
 });
 
 const itemSelectorLayoutLifecycle = useItemsSelectorLayoutLifecycle({
@@ -669,7 +670,8 @@ const add_item = async (item, optionsOrQty: any = {}) => {
 			selected_currency: selected_currency.value,
 			exchange_rate: selected_exchange_rate.value,
 			conversion_rate: selected_conversion_rate.value,
-			price_list_currency: item.original_currency || item.price_list_currency || pos_profile.value?.currency,
+			price_list_currency:
+				item.original_currency || item.price_list_currency || pos_profile.value?.currency,
 			itemCurrencyUtils,
 			invoiceStore,
 			eventBus,
@@ -872,7 +874,8 @@ onMounted(async () => {
 		applyCurrencyConversionToItem: (item) => {
 			itemCurrencyUtils.applyCurrencyConversionToItem(item, {
 				pos_profile: pos_profile.value,
-				price_list_currency: item?.original_currency || item?.price_list_currency || pos_profile.value?.currency,
+				price_list_currency:
+					item?.original_currency || item?.price_list_currency || pos_profile.value?.currency,
 				selected_currency: selected_currency.value || pos_profile.value?.currency,
 				exchange_rate: selected_exchange_rate.value,
 				conversion_rate: selected_conversion_rate.value,

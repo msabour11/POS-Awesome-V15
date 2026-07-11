@@ -1,6 +1,6 @@
 <template>
 	<div class="items-card-container">
-		<div v-if="isLoading" class="items-card-grid">
+		<div v-if="isLoading" class="items-card-grid" :style="{ '--card-columns': Math.max(1, cardColumns) }">
 			<Skeleton v-for="n in 8" :key="n" class="mb-4" height="120" />
 		</div>
 		<div
