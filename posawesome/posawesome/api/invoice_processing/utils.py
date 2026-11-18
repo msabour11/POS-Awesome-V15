@@ -10,6 +10,10 @@ from frappe.utils import (
     strip_html_tags,
 )
 from erpnext.setup.utils import get_exchange_rate
+from posawesome.posawesome.api.selling_price_lists import (
+    get_configured_selling_price_lists,
+    get_manual_selling_price_list_filters,
+)
 
 
 def _get_return_validity_settings(pos_profile: str | None = None):
@@ -80,6 +84,9 @@ def _resolve_effective_price_list(
     customer_name: str | None,
     pos_profile: str | None,
     fallback_price_list: str | None = None,
+    *,
+    allow_selection: bool = False,
+    profile_doc=None,
 ) -> str | None:
     customer_price_list = None
     if customer_name:
@@ -87,12 +94,28 @@ def _resolve_effective_price_list(
     if customer_price_list:
         return customer_price_list
 
-    if pos_profile:
-        profile_price_list = frappe.db.get_value("POS Profile", pos_profile, "selling_price_list")
-        if profile_price_list:
-            return profile_price_list
+    if allow_selection:
+        customer_group = (
+            frappe.db.get_value("Customer", customer_name, "customer_group") if customer_name else None
+        )
+        if customer_group:
+            group_price_list = frappe.db.get_value("Customer Group", customer_group, "default_price_list")
+            if group_price_list:
+                return group_price_list
+    profile_price_list = (
+        frappe.db.get_value("POS Profile", pos_profile, "selling_price_list") if pos_profile else None
+    )
+    if allow_selection and fallback_price_list and fallback_price_list != profile_price_list:
+        configured = get_configured_selling_price_lists(profile_doc)
+        if configured and fallback_price_list not in configured:
+            frappe.throw(_("Price List {0} is not allowed for this POS Profile.").format(fallback_price_list))
+        filters = get_manual_selling_price_list_filters(profile_doc)
+        filters["name"] = fallback_price_list
+        if not frappe.db.exists("Price List", filters):
+            frappe.throw(_("Price List {0} is not allowed for this POS Profile.").format(fallback_price_list))
+        return fallback_price_list
 
-    return fallback_price_list
+    return profile_price_list or fallback_price_list
 
 
 def _build_invoice_remarks(invoice_doc):
@@ -113,31 +136,75 @@ def _build_invoice_remarks(invoice_doc):
     return "\n".join(lines)
 
 
-def get_latest_rate(from_currency: str, to_currency: str, cache=None):
-    """Return the most recent Currency Exchange rate and its date."""
+def get_latest_rate(
+    from_currency: str,
+    to_currency: str,
+    cache=None,
+    transaction_date=None,
+    purpose=None,
+    allow_external=True,
+    silent=False,
+):
+    """Return the latest ERPNext-valid rate on or before ``transaction_date``.
+
+    ``purpose`` may be ``for_buying`` or ``for_selling``. Optional POS lookups
+    use ``silent=True`` so ERPNext's external-rate fallback cannot add repeated
+    desk messages when a rate is unavailable.
+    """
+    transaction_date = getdate(transaction_date or nowdate())
     if from_currency == to_currency:
-        result = 1.0, nowdate()
+        result = 1.0, transaction_date
         if cache is not None:
-            cache[(from_currency, to_currency)] = result
+            cache[(from_currency, to_currency, str(transaction_date), purpose)] = result
         return result
 
     if cache is not None:
-        key = (from_currency, to_currency)
+        key = (from_currency, to_currency, str(transaction_date), purpose)
         if key in cache:
             return cache[key]
 
+    filters = {
+        "from_currency": from_currency,
+        "to_currency": to_currency,
+        "date": ["<=", transaction_date],
+    }
+    if purpose in {"for_buying", "for_selling"}:
+        filters[purpose] = 1
+
+    try:
+        accounts_settings = frappe.get_cached_doc("Accounts Settings")
+    except Exception:
+        accounts_settings = None
+    if accounts_settings and not cint(accounts_settings.get("allow_stale")):
+        stale_days = cint(accounts_settings.get("stale_days"))
+        filters["date"] = ["between", [add_days(transaction_date, -stale_days), transaction_date]]
+
     rate_doc = frappe.get_all(
         "Currency Exchange",
-        filters={"from_currency": from_currency, "to_currency": to_currency},
+        filters=filters,
         fields=["exchange_rate", "date"],
         order_by="date desc, creation desc",
         limit=1,
     )
     if rate_doc:
         result = flt(rate_doc[0].exchange_rate), rate_doc[0].date
+    elif allow_external:
+        message_log = getattr(frappe, "message_log", None)
+        message_count = len(message_log) if isinstance(message_log, list) else None
+        flags = getattr(frappe, "flags", None)
+        old_mute = getattr(flags, "mute_messages", False)
+        try:
+            if silent and flags is not None:
+                flags.mute_messages = True
+            rate = get_exchange_rate(from_currency, to_currency, transaction_date, purpose)
+        finally:
+            if flags is not None:
+                flags.mute_messages = old_mute
+            if silent and message_count is not None:
+                del message_log[message_count:]
+        result = (flt(rate), transaction_date) if flt(rate) > 0 else (None, None)
     else:
-        rate = get_exchange_rate(from_currency, to_currency, nowdate())
-        result = flt(rate), nowdate()
+        result = None, None
 
     if cache is not None:
         cache[key] = result
@@ -164,6 +231,7 @@ def resolve_erpnext_currency_rates(
             invoice_currency,
             company_currency,
             cache=cache,
+            transaction_date=exchange_rate_date,
         )
 
     plc_conversion_rate = 1.0
@@ -172,6 +240,7 @@ def resolve_erpnext_currency_rates(
             price_list_currency,
             company_currency,
             cache=cache,
+            transaction_date=exchange_rate_date,
         )
 
     return {

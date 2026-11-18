@@ -1,4 +1,18 @@
-import { checkDbHealth, db, initPromise, memory, persist, safeBulkPut } from "./db";
+import {
+	db,
+	memory,
+	persist,
+	registerPostHydrationTask,
+	startupInitPromise,
+} from "./db";
+import {
+	ensureOfflineQueueReady,
+	SYNCING_LEASE_MS,
+	getQueueEntries,
+	markWriteQueueEntrySyncedByIdempotencyKey,
+} from "./writeQueue";
+import { requireSubmittedInvoice } from "./invoiceAcknowledgement";
+import { captureOfflineInvoiceTime } from "./invoiceTimestamp";
 
 type AnyRecord = Record<string, any>;
 
@@ -28,6 +42,7 @@ export interface InvoiceOutboxEntry {
 }
 
 const TABLE = "invoice_outbox";
+const JOURNAL_PREFIX = "posa_invoice_intent_";
 const MAX_RETRY_COUNT = 5;
 const INITIAL_BACKOFF_MS = 5_000;
 const MAX_BACKOFF_MS = 5 * 60 * 1_000;
@@ -55,8 +70,9 @@ function toErrorMessage(error: unknown) {
 }
 
 async function ensureOutboxReady() {
-	await initPromise;
-	await checkDbHealth();
+	if (!db.isOpen()) {
+		await startupInitPromise;
+	}
 	if (!db.isOpen()) {
 		await db.open();
 	}
@@ -85,12 +101,87 @@ function getClientRequestId(entry: AnyRecord) {
 	).trim();
 }
 
+function journalKey(clientRequestId: string) {
+	return `${JOURNAL_PREFIX}${encodeURIComponent(clientRequestId)}`;
+}
+
+export function persistInvoiceIntentJournal(entry: AnyRecord) {
+	const cleanEntry = cloneSerializable(entry);
+	if (["Sales Invoice", "POS Invoice"].includes(cleanEntry.invoice?.doctype))
+		captureOfflineInvoiceTime(cleanEntry.invoice);
+	const clientRequestId = getClientRequestId(cleanEntry);
+	if (!clientRequestId) {
+		throw new Error("Invoice intent journal requires a client_request_id");
+	}
+	if (typeof localStorage !== "undefined") {
+		localStorage.setItem(
+			journalKey(clientRequestId),
+			JSON.stringify(cleanEntry),
+		);
+	}
+	return clientRequestId;
+}
+
+export function removeInvoiceIntentJournal(clientRequestId: string) {
+	const normalizedId = String(clientRequestId || "").trim();
+	if (normalizedId && typeof localStorage !== "undefined") {
+		localStorage.removeItem(journalKey(normalizedId));
+	}
+}
+
+async function recoverInvoiceIntentJournal() {
+	if (typeof localStorage === "undefined") return;
+	const entries: AnyRecord[] = [];
+	for (let index = 0; index < localStorage.length; index += 1) {
+		const key = localStorage.key(index);
+		if (!key?.startsWith(JOURNAL_PREFIX)) continue;
+		try {
+			const entry = JSON.parse(localStorage.getItem(key) || "null");
+			if (entry) entries.push(entry);
+		} catch (error) {
+			console.warn(
+				"Ignoring invalid invoice intent journal entry",
+				error,
+			);
+		}
+	}
+	for (const entry of entries) {
+		await enqueueInvoiceOutboxEntry(entry);
+	}
+}
+
 export async function enqueueInvoiceOutboxEntry(entry: AnyRecord) {
 	await ensureOutboxReady();
 	const cleanEntry = cloneSerializable(entry);
 	const clientRequestId = getClientRequestId(cleanEntry);
 	if (!clientRequestId) {
 		throw new Error("Invoice outbox entry requires a client_request_id");
+	}
+	if (
+		["Sales Invoice", "POS Invoice"].includes(cleanEntry.invoice?.doctype)
+	) {
+		const journal =
+			typeof localStorage !== "undefined"
+				? localStorage.getItem(journalKey(clientRequestId))
+				: null;
+		try {
+			const captured = journal ? JSON.parse(journal)?.invoice : null;
+			if (
+				captured?._posa_offline_created_at &&
+				!cleanEntry.invoice._posa_offline_created_at
+			) {
+				for (const field of [
+					"_posa_offline_created_at",
+					"posting_date",
+					"posting_time",
+					"set_posting_time",
+				])
+					cleanEntry.invoice[field] = captured[field];
+			}
+		} catch (error) {
+			console.warn("Unable to read invoice recovery timestamp", error);
+		}
+		captureOfflineInvoiceTime(cleanEntry.invoice);
 	}
 
 	const table = db.table(TABLE);
@@ -100,7 +191,19 @@ export async function enqueueInvoiceOutboxEntry(entry: AnyRecord) {
 			.equals(clientRequestId)
 			.first()) as InvoiceOutboxEntry | undefined;
 		if (existing) {
-			return existing;
+			if (
+				existing.status === "syncing" ||
+				existing.status === "acknowledged"
+			)
+				return existing;
+			const refreshed = {
+				...existing,
+				invoice: cleanEntry.invoice,
+				data: cleanEntry.data || {},
+				updated_at: nowIso(),
+			};
+			await table.put(refreshed);
+			return refreshed;
 		}
 
 		const timestamp = nowIso();
@@ -138,11 +241,50 @@ export async function getInvoiceOutboxRows(
 }
 
 export async function getPendingInvoiceOutboxCount() {
-	return (await getInvoiceOutboxRows()).length;
+	return (await getInvoiceOutboxRows({ includeTerminal: true })).filter(
+		(row) => row.status !== "acknowledged",
+	).length;
+}
+
+export async function removeInvoiceOutboxEntry(clientRequestId: string) {
+	const normalizedId = String(clientRequestId || "").trim();
+	if (!normalizedId) return 0;
+	await ensureOutboxReady();
+	const deleted = await db
+		.table(TABLE)
+		.where("client_request_id")
+		.equals(normalizedId)
+		.delete();
+	removeInvoiceIntentJournal(normalizedId);
+	return deleted;
+}
+
+export async function acknowledgeInvoiceOutbox(
+	clientRequestId: string,
+	response: AnyRecord,
+) {
+	requireSubmittedInvoice(response);
+	await ensureOutboxReady();
+	const table = db.table(TABLE);
+	await db.transaction("rw", table, async () => {
+		const row = await table
+			.where("client_request_id")
+			.equals(clientRequestId)
+			.first();
+		if (row)
+			await table.put(
+				markOutboxAcknowledged(row, response?.message || response),
+			);
+	});
+	removeInvoiceIntentJournal(clientRequestId);
 }
 
 function shouldAttempt(row: InvoiceOutboxEntry) {
 	if (TERMINAL_STATUSES.has(row.status)) return false;
+	if (row.status === "syncing") {
+		const started = Date.parse(row.updated_at);
+		return !Number.isFinite(started) || Date.now() - started >= SYNCING_LEASE_MS;
+	}
 	if (!row.next_retry_at) return true;
 	const nextRetryAt = Date.parse(row.next_retry_at);
 	return !Number.isFinite(nextRetryAt) || nextRetryAt <= Date.now();
@@ -175,7 +317,10 @@ function markOutboxAcknowledged(
 	};
 }
 
-function markOutboxFailed(row: InvoiceOutboxEntry, error: unknown): InvoiceOutboxEntry {
+function markOutboxFailed(
+	row: InvoiceOutboxEntry,
+	error: unknown,
+): InvoiceOutboxEntry {
 	const retryCount = Number(row.retry_count || 0) + 1;
 	const status: InvoiceOutboxStatus =
 		retryCount >= MAX_RETRY_COUNT ? "dead_letter" : "retrying";
@@ -202,21 +347,65 @@ export async function syncInvoiceOutboxResource(
 	) => Promise<any>,
 ) {
 	await ensureOutboxReady();
-	const rows = await getInvoiceOutboxRows();
+	await ensureOfflineQueueReady();
+	// Coordinator adoption must not strand invoices saved before dual-write was enabled.
+	const legacyRows = await getQueueEntries("invoice");
+	const adoptionTable = db.table(TABLE);
+	await db.transaction("rw", adoptionTable, async () => {
+		for (const legacy of legacyRows) {
+			const id = getClientRequestId(legacy.payload);
+			if (
+				!id ||
+				(await adoptionTable
+					.where("client_request_id")
+					.equals(id)
+					.first())
+			)
+				continue;
+			const timestamp = nowIso();
+			await adoptionTable.add({
+				client_request_id: id,
+				resource: "invoice_outbox",
+				invoice: legacy.payload.invoice,
+				data: legacy.payload.data || {},
+				created_at: legacy.created_at,
+				updated_at: legacy.last_attempt_at || timestamp,
+				retry_count: legacy.retry_count,
+				status:
+					legacy.status === "dead_letter"
+						? "dead_letter"
+						: legacy.status === "syncing"
+							? "syncing"
+							: "pending",
+				next_retry_at: null,
+				nextAttemptAt: null,
+				last_error: legacy.last_error,
+				invoice_name: null,
+				acknowledged_at: null,
+			});
+		}
+	});
 	let acknowledged = 0;
 	let failed = 0;
 	const claimTimestamp = nowIso();
-	const attemptRows = rows.filter((row) => shouldAttempt(row));
-	const claimedRows: InvoiceOutboxEntry[] = attemptRows.map((row) => ({
-		...row,
-		resource: "invoice_outbox" as const,
-		status: "syncing" as InvoiceOutboxStatus,
-		updated_at: claimTimestamp,
-		nextAttemptAt: row.next_retry_at || null,
-	}));
-	if (claimedRows.length) {
-		await safeBulkPut(TABLE, claimedRows);
-	}
+	const table = db.table(TABLE);
+	// IndexedDB transaction serializes claims across tabs and coordinator runs.
+	const claimedRows = await db.transaction("rw", table, async () => {
+		const rows = (await table
+			.orderBy("created_at")
+			.toArray()) as InvoiceOutboxEntry[];
+		const claimed = rows
+			.filter(shouldAttempt)
+			.map((row) => ({
+				...row,
+				resource: "invoice_outbox" as const,
+				status: "syncing" as const,
+				updated_at: claimTimestamp,
+				nextAttemptAt: row.next_retry_at || null,
+			}));
+		if (claimed.length) await table.bulkPut(claimed);
+		return claimed;
+	});
 	const finalRows: InvoiceOutboxEntry[] = [];
 
 	for (const claimed of claimedRows) {
@@ -229,7 +418,8 @@ export async function syncInvoiceOutboxResource(
 					data: claimed.data,
 				},
 			);
-			if (response?.acknowledged || response?.invoice || response?.name) {
+			requireSubmittedInvoice(response);
+			if (response?.acknowledged !== false) {
 				finalRows.push(markOutboxAcknowledged(claimed, response || {}));
 				acknowledged += 1;
 			} else {
@@ -241,16 +431,39 @@ export async function syncInvoiceOutboxResource(
 		}
 	}
 	if (finalRows.length) {
-		await safeBulkPut(TABLE, finalRows);
+		const committed: InvoiceOutboxEntry[] = [];
+		await db.transaction("rw", table, async () => {
+			for (const row of finalRows) {
+				const current = await table.get(row.outbox_id!);
+				if (
+					current?.status !== "syncing" ||
+					current.updated_at !== claimTimestamp
+				)
+					continue;
+				await table.put(row);
+				committed.push(row);
+			}
+		});
+		const acknowledgedRows = committed.filter(
+			(row) => row.status === "acknowledged",
+		);
+		for (const row of acknowledgedRows) {
+			removeInvoiceIntentJournal(row.client_request_id);
+			await markWriteQueueEntrySyncedByIdempotencyKey(
+				"invoice",
+				`invoice:${row.client_request_id}`,
+			);
+		}
 	}
 
 	const pending = await getPendingInvoiceOutboxCount();
 	return {
 		resourceId: "invoice_outbox",
-		status: failed ? "error" : "fresh",
-		lastError: failed
-			? `${failed} invoice outbox entr${failed === 1 ? "y" : "ies"} failed`
-			: null,
+		status: failed || pending ? "error" : "fresh",
+		lastError:
+			failed || pending
+				? `${pending} invoice(s) remain pending; ${failed} attempt(s) failed. Review recovery status.`
+				: null,
 		watermark: nowIso(),
 		lastSyncedAt: nowIso(),
 		consecutiveFailures: failed ? 1 : 0,
@@ -258,3 +471,5 @@ export async function syncInvoiceOutboxResource(
 		acknowledged,
 	};
 }
+
+registerPostHydrationTask(recoverInvoiceIntentJournal);

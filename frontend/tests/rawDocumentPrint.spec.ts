@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/posapp/services/qzTray", () => ({
+	prepareQzPrinter: vi.fn(async (printerName?: string) => printerName),
 	sendRawToQz: vi.fn(),
 }));
 
@@ -11,9 +12,32 @@ import {
 	printRawDocumentViaQz,
 	shouldUseRawDocumentPrinting,
 } from "../src/posapp/services/rawDocumentPrint";
-import { sendRawToQz } from "../src/posapp/services/qzTray";
+import { prepareQzPrinter, sendRawToQz } from "../src/posapp/services/qzTray";
 
 describe("rawDocumentPrint", () => {
+	it("prints a local pending copy without fetching an invoice from the server", async () => {
+		await printRawDocumentViaQz({
+			doctype: "Sales Invoice",
+			name: "Offline id",
+			localOnly: true,
+			doc: {
+				_posa_receipt_label: "OFFLINE COPY - PENDING SERVER SYNC",
+				posa_client_request_id: "original-request",
+				posting_date: "2026-11-10",
+				posting_time: "10:20:30",
+				grand_total: 100,
+			},
+			profile: {},
+		});
+		expect(frappe.call).not.toHaveBeenCalled();
+		expect(sendRawToQz).toHaveBeenCalledWith(
+			expect.stringContaining("original-request"),
+			undefined,
+		);
+		expect(vi.mocked(sendRawToQz).mock.calls[0][0]).toContain(
+			"PENDING SERVER SYNC",
+		);
+	});
 	beforeEach(() => {
 		vi.clearAllMocks();
 		delete (globalThis as any).__;
@@ -89,6 +113,35 @@ describe("rawDocumentPrint", () => {
 		expect(raw).toContain(longName.slice(32));
 	});
 
+	it("prints original tender and settlement currencies for Payment Entry", () => {
+		const raw = buildEscPosDocument(
+			{
+				doctype: "Payment Entry",
+				name: "ACC-PAY-0001",
+				company: "Demo Company",
+				payment_type: "Receive",
+				mode_of_payment: "Cash",
+				posa_payment_currency: "PKR",
+				posa_original_amount: 29.93,
+				posa_invoice_currency: "USD",
+				paid_amount: 0.105,
+				paid_from_account_currency: "USD",
+				received_amount: 29.93,
+				paid_to_account_currency: "PKR",
+			},
+			{
+				doctype: "Payment Entry",
+				name: "ACC-PAY-0001",
+				profile: { posa_raw_print_width: 42 },
+			},
+		);
+
+		expect(raw).toContain("Tender");
+		expect(raw).toContain("PKR 29.93");
+		expect(raw).toContain("Settlement");
+		expect(raw).toContain("USD 0.10");
+	});
+
 	it("preserves localized receipt text and translates raw receipt labels", () => {
 		(globalThis as any).__ = vi.fn((text: string) => {
 			if (text === "Grand Total") return "Total général";
@@ -131,8 +184,12 @@ describe("rawDocumentPrint", () => {
 	});
 
 	it("uses POS Profile raw printing toggle only when enabled", () => {
-		expect(shouldUseRawDocumentPrinting({ posa_raw_printing: 1 })).toBe(true);
-		expect(shouldUseRawDocumentPrinting({ posa_raw_printing: "0" })).toBe(false);
+		expect(shouldUseRawDocumentPrinting({ posa_raw_printing: 1 })).toBe(
+			true,
+		);
+		expect(shouldUseRawDocumentPrinting({ posa_raw_printing: "0" })).toBe(
+			false,
+		);
 		expect(shouldUseRawDocumentPrinting({})).toBe(false);
 	});
 
@@ -168,6 +225,23 @@ describe("rawDocumentPrint", () => {
 		);
 	});
 
+	it("checks QZ before fetching the saved document", async () => {
+		vi.mocked(prepareQzPrinter).mockRejectedValueOnce(
+			new Error("QZ Tray is not available."),
+		);
+
+		await expect(
+			printRawDocumentViaQz({
+				doctype: "Sales Invoice",
+				name: "SINV-FAST-FALLBACK",
+				profile: { posa_raw_printing: 1 },
+			}),
+		).rejects.toThrow("QZ Tray is not available");
+
+		expect((globalThis as any).frappe.call).not.toHaveBeenCalled();
+		expect(sendRawToQz).not.toHaveBeenCalled();
+	});
+
 	it("forwards the POS Profile raw printer name to QZ", async () => {
 		(globalThis as any).frappe.call.mockResolvedValue({
 			message: {
@@ -196,7 +270,9 @@ describe("rawDocumentPrint", () => {
 	});
 
 	it("rejects when the saved document cannot be fetched and no fallback doc is provided", async () => {
-		(globalThis as any).frappe.call.mockRejectedValue(new Error("Network down"));
+		(globalThis as any).frappe.call.mockRejectedValue(
+			new Error("Network down"),
+		);
 
 		await expect(
 			printRawDocumentViaQz({

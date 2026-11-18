@@ -1,5 +1,9 @@
 <template>
-	<nav :class="['pos-themed-card', rtlClasses]">
+	<nav
+		:class="['pos-themed-card', rtlClasses]"
+		data-test="pos-navbar"
+		:data-pos-profile="posProfile?.name || ''"
+	>
 		<!-- Use the modular NavbarAppBar component -->
 		<NavbarAppBar
 			:pos-profile="posProfile"
@@ -110,7 +114,7 @@
 
 		<!-- Use the modular AboutDialog component -->
 		<AboutDialog v-model="showAboutDialog" />
-		<EmployeeSwitchDialog />
+		<EmployeeSwitchDialog @retry-load="fetchTerminalEmployees" />
 
 		<!-- Keep existing dialogs -->
 		<v-dialog v-model="isFrozen" persistent max-width="290">
@@ -123,6 +127,7 @@
 		<OfflineInvoicesDialog
 			v-model="showOfflineInvoices"
 			:pos-profile="posProfile"
+			:pending-count="pendingInvoices"
 			@deleted="updateAfterDelete"
 			@sync-all="syncPendingInvoices"
 		/>
@@ -162,10 +167,19 @@ import AboutDialog from "./navbar/AboutDialog.vue";
 import OfflineInvoices from "./OfflineInvoices.vue";
 import EmployeeSwitchDialog from "./pos/employee/EmployeeSwitchDialog.vue";
 import posLogo from "./pos/pos.png";
+import { POS_BRAND_NAME } from "../config/branding";
 import { forceClearAllCache } from "../../offline/index";
 import { clearAllCaches } from "../../utils/clearAllCaches";
 import { isOffline } from "../../offline/index";
+import { cacheOfflineCashiers, loadOfflineCashiers } from "../utils/offlineCashier";
 import { useRtl } from "../composables/core/useRtl";
+import { withRequestTimeout } from "../utils/requestTimeout";
+import { translate } from "../utils/translate";
+import { requestSafeRefresh } from "../services/safeRefresh";
+import { finishStartupPhase, startStartupPhase } from "../../utils/startupTrace";
+import { loadCachedTerminalEmployees, saveCachedTerminalEmployees } from "../utils/terminalEmployeeCache";
+
+const TERMINAL_SECURITY_REQUEST_TIMEOUT_MS = 20_000;
 
 const ServerUsageGadget = defineAsyncComponent(() => import("./navbar/ServerUsageGadget.vue"));
 const DatabaseUsageGadget = defineAsyncComponent(() => import("./navbar/DatabaseUsageGadget.vue"));
@@ -304,7 +318,7 @@ export default {
 				{ text: "Barcode Printing", icon: "mdi-barcode", to: "/barcode" },
 			],
 			items: [],
-			company: "POS Awesome",
+			company: POS_BRAND_NAME,
 			companyImg: posLogo,
 			showAboutDialog: false,
 			showOfflineInvoices: false,
@@ -313,6 +327,11 @@ export default {
 			syncNotificationPrimed: false,
 			employeeSwitchHandler: null,
 			lockPosHandler: null,
+			terminalSecurityChannel: null,
+			terminalLockRetryHandle: null,
+			terminalLockRetryAttempt: 0,
+			terminalLockRequestInFlight: null,
+			terminalEmployeesRequestId: 0,
 		};
 	},
 	watch: {
@@ -331,9 +350,14 @@ export default {
 		posProfile: {
 			handler() {
 				this.updateNavigationItems();
-				void this.fetchTerminalEmployees();
 			},
 			deep: true,
+			immediate: true,
+		},
+		posProfileName: {
+			handler() {
+				void this.fetchTerminalEmployees();
+			},
 			immediate: true,
 		},
 		offlineStatusState: {
@@ -351,6 +375,9 @@ export default {
 		},
 	},
 	computed: {
+		posProfileName() {
+			return String(this.posProfile?.name || "").trim();
+		},
 		appBarColor() {
 			return this.isDark ? this.$vuetify.theme.themes.dark.colors.surface : "white";
 		},
@@ -486,6 +513,7 @@ export default {
 		this.initializeNavbar();
 		this.setupEventListeners();
 		this.syncOfflineStatusSurface();
+		this.setupTerminalSecurityChannel();
 	},
 
 	created() {
@@ -493,6 +521,12 @@ export default {
 		this.preInitialize();
 	},
 	unmounted() {
+		if (this.terminalLockRetryHandle !== null) {
+			clearTimeout(this.terminalLockRetryHandle);
+			this.terminalLockRetryHandle = null;
+		}
+		this.terminalSecurityChannel?.close?.();
+		this.terminalSecurityChannel = null;
 		if (this.notificationUpdateHandle !== null) {
 			if (this.notificationUpdateUsesTimeout) {
 				clearTimeout(this.notificationUpdateHandle);
@@ -561,29 +595,185 @@ export default {
 			this.items = items;
 		},
 		async fetchTerminalEmployees() {
-			if (!this.posProfile?.name) {
-				this.employeeStore.setTerminalEmployees([]);
+			const profileName = this.posProfileName;
+			const requestId = ++this.terminalEmployeesRequestId;
+			if (!profileName) {
+				this.employeeStore.resetTerminalEmployeesLoad();
+				this.employeeStore.applyTerminalState(null);
 				return;
 			}
 
-			try {
-				const response = await frappe.call({
-					method: "posawesome.posawesome.api.employees.get_terminal_employees",
-					args: {
-						pos_profile: this.posProfile.name,
-					},
-				});
-				this.employeeStore.setTerminalEmployees(response?.message || []);
-			} catch (error) {
-				console.error("Failed to load terminal employees", error);
-				this.employeeStore.setTerminalEmployees([]);
+			const sessionUser = String(frappe.session?.user || "").trim();
+			const cachedEmployees = loadCachedTerminalEmployees(sessionUser, profileName);
+			const phase = startStartupPhase("cashier.employee_loading", {
+				profile: profileName,
+				cachedCount: cachedEmployees.length,
+				timeoutMs: TERMINAL_SECURITY_REQUEST_TIMEOUT_MS,
+			});
+			this.employeeStore.beginTerminalEmployeesLoad(profileName, cachedEmployees);
+			if (isOffline()) {
+				this.employeeStore.completeTerminalEmployeesLoad(
+					profileName,
+					loadOfflineCashiers(profileName),
+				);
+				this.employeeStore.applyTerminalState(null);
+				finishStartupPhase(phase, "ok", { offline: true });
+				return;
 			}
+			const employeesRequest = withRequestTimeout(
+				Promise.resolve().then(() =>
+					frappe.call({
+						method: "posawesome.posawesome.api.employees.get_terminal_employees",
+						args: {
+							pos_profile: profileName,
+							include_offline_access: 1,
+						},
+					}),
+				),
+				TERMINAL_SECURITY_REQUEST_TIMEOUT_MS,
+				"Timed out loading authorized cashiers.",
+			);
+			const stateRequest = withRequestTimeout(
+				Promise.resolve().then(() =>
+					frappe.call({
+						method: "posawesome.posawesome.api.employees.get_terminal_state",
+						args: {
+							pos_profile: profileName,
+						},
+					}),
+				),
+				TERMINAL_SECURITY_REQUEST_TIMEOUT_MS,
+				"Timed out loading terminal state.",
+			);
+
+			const [employeesResult] = await Promise.allSettled([employeesRequest]);
+
+			if (requestId !== this.terminalEmployeesRequestId || profileName !== this.posProfileName) {
+				return;
+			}
+
+			if (employeesResult.status === "fulfilled" && Array.isArray(employeesResult.value?.message)) {
+				this.employeeStore.completeTerminalEmployeesLoad(profileName, employeesResult.value.message);
+				saveCachedTerminalEmployees(sessionUser, profileName, employeesResult.value.message);
+				try {
+					cacheOfflineCashiers(profileName, employeesResult.value.message);
+				} catch (error) {
+					console.warn("Unable to cache offline cashier access", error);
+				}
+			} else {
+				const error =
+					employeesResult.status === "rejected"
+						? employeesResult.reason
+						: new Error("Cashier API returned an invalid response.");
+				console.error("Failed to load terminal employees", error);
+				this.employeeStore.failTerminalEmployeesLoad(
+					profileName,
+					this.__(
+						"Unable to load cashiers for this POS profile. The server took too long to respond; retry when ready.",
+					),
+				);
+			}
+
+			const [stateResult] = await Promise.allSettled([stateRequest]);
+
+			if (requestId !== this.terminalEmployeesRequestId || profileName !== this.posProfileName) {
+				return;
+			}
+
+			if (stateResult.status === "fulfilled") {
+				if (this.employeeStore.terminalLockPending && stateResult.value?.message?.locked !== true) {
+					this.scheduleTerminalLockRetry();
+				} else {
+					this.employeeStore.applyTerminalState(stateResult.value?.message);
+				}
+			} else {
+				console.error("Failed to load authoritative terminal state", stateResult.reason);
+				this.employeeStore.applyTerminalState(null);
+			}
+			finishStartupPhase(
+				phase,
+				employeesResult.status === "fulfilled" && stateResult.status === "fulfilled" ? "ok" : "error",
+				{
+					employeeCount:
+						employeesResult.status === "fulfilled" &&
+						Array.isArray(employeesResult.value?.message)
+							? employeesResult.value.message.length
+							: 0,
+				},
+			);
 		},
 		openEmployeeSwitch() {
 			this.employeeStore.openEmployeeSwitch();
 		},
-		lockPosScreen() {
-			this.employeeStore.lockTerminal();
+		setupTerminalSecurityChannel() {
+			if (typeof window === "undefined" || typeof window.BroadcastChannel !== "function") {
+				return;
+			}
+			this.terminalSecurityChannel = new window.BroadcastChannel("posa-terminal-security");
+			this.terminalSecurityChannel.onmessage = (event) => {
+				const message = event?.data;
+				if (message?.type !== "lock-intent" || message?.posProfile !== this.posProfile?.name) {
+					return;
+				}
+				this.employeeStore.markTerminalLockPending();
+				this.scheduleTerminalLockRetry(0);
+			};
+		},
+		scheduleTerminalLockRetry(delay) {
+			if (this.terminalLockRetryHandle !== null) return;
+			const retryDelay =
+				delay ?? Math.min(1000 * 2 ** Math.min(this.terminalLockRetryAttempt, 5), 30000);
+			this.terminalLockRetryHandle = setTimeout(() => {
+				this.terminalLockRetryHandle = null;
+				void this.persistTerminalLock();
+			}, retryDelay);
+		},
+		async persistTerminalLock() {
+			if (!this.posProfile?.name) return false;
+			if (isOffline()) return true;
+			if (this.terminalLockRequestInFlight) {
+				return this.terminalLockRequestInFlight;
+			}
+
+			this.terminalLockRequestInFlight = (async () => {
+				try {
+					const response = await frappe.call({
+						method: "posawesome.posawesome.api.employees.lock_terminal",
+						args: {
+							pos_profile: this.posProfile.name,
+						},
+					});
+					if (response?.message?.locked !== true) {
+						throw new Error("Server did not confirm terminal lock.");
+					}
+					this.employeeStore.applyTerminalState(response.message);
+					this.terminalLockRetryAttempt = 0;
+					return true;
+				} catch (error) {
+					console.error("Failed to persist terminal lock", error);
+					this.employeeStore.markTerminalLockPending();
+					this.terminalLockRetryAttempt += 1;
+					this.scheduleTerminalLockRetry();
+					return false;
+				} finally {
+					this.terminalLockRequestInFlight = null;
+				}
+			})();
+			return this.terminalLockRequestInFlight;
+		},
+		async lockPosScreen() {
+			this.employeeStore.markTerminalLockPending();
+			this.terminalSecurityChannel?.postMessage?.({
+				type: "lock-intent",
+				posProfile: this.posProfile?.name,
+			});
+			const locked = await this.persistTerminalLock();
+			if (!locked) {
+				this.toastStore.show({
+					title: this.__("Server lock pending; this tab remains blocked."),
+					color: "warning",
+				});
+			}
 		},
 
 		initializeNavbar() {
@@ -856,7 +1046,7 @@ export default {
 			} finally {
 				this.clearingCache = false;
 				if (shouldReload) {
-					setTimeout(() => location.reload(), 1000);
+					setTimeout(() => requestSafeRefresh(), 1000);
 				}
 			}
 		},
@@ -1011,11 +1201,7 @@ export default {
 			}, 250);
 		},
 		__(text, args = []) {
-			if (window.__) {
-				const nextArgs = Array.isArray(args) ? args : [args];
-				return window.__(text, ...nextArgs);
-			}
-			return text;
+			return translate(text, args);
 		},
 	},
 	emits: [

@@ -1,6 +1,24 @@
 <template>
 	<!-- Main Invoice Wrapper -->
-	<div class="pa-0 invoice-shell">
+	<div
+		class="pa-0 invoice-shell"
+		:class="{ 'invoice-shell--counter-grid': isCounterGridPresentation }"
+		:data-testid="isCounterGridPresentation ? 'counter-grid-invoice' : 'classic-invoice'"
+	>
+		<v-alert v-if="cartRecoveryError" type="error" variant="tonal" data-test="cart-recovery-error">{{ cartRecoveryError }}</v-alert>
+		<v-alert v-else-if="cartRecoveryMessage" type="info" variant="tonal" closable @click:close="cartRecoveryMessage = ''">{{ cartRecoveryMessage }}</v-alert>
+		<SavedCartRecovery
+			:candidates="cartRecoveryCandidates"
+			:warning="cartRecoveryReviewWarning"
+			:busy="cartRecoveryBusy"
+			:has-items="items.length > 0"
+			@recover="recoverSavedCart"
+			@refresh="refreshSavedCarts"
+		/>
+		<v-overlay :model-value="cartRecoveryBusy" persistent class="align-center justify-center">
+			<v-progress-circular indeterminate color="primary" />
+			<span>{{ __("Recovering saved cart") }}</span>
+		</v-overlay>
 		<!-- Cancel Sale Confirmation Dialog -->
 		<CancelSaleDialog v-model="cancel_dialog" @confirm="cancel_invoice" />
 
@@ -8,15 +26,16 @@
 		<v-card
 			ref="invoiceCard"
 			:style="{
-				height: invoiceHeight || 'var(--container-height)',
-				maxHeight: invoiceHeight || 'var(--container-height)',
-				resize: canResizeInvoicePanel() ? 'vertical' : 'none',
-				overflow: 'auto',
+				height: isCounterGridPresentation ? 'auto' : invoiceHeight || 'var(--container-height)',
+				maxHeight: isCounterGridPresentation ? 'none' : invoiceHeight || 'var(--container-height)',
+				resize: !isCounterGridPresentation && canResizeInvoicePanel() ? 'vertical' : 'none',
+				overflow: isCounterGridPresentation ? 'hidden' : 'auto',
 			}"
 			:class="[
 				'cards my-0 py-0 mt-3 resizable invoice-main-card',
 				'pos-themed-card',
 				{ 'return-mode': isReturnInvoice },
+				{ 'invoice-main-card--counter-grid': isCounterGridPresentation },
 			]"
 			@mouseup="saveInvoiceHeight($refs.invoiceCard)"
 			@touchend="saveInvoiceHeight($refs.invoiceCard)"
@@ -75,7 +94,7 @@
 
 					<div class="invoice-meta-grid">
 						<v-card
-							v-if="pos_profile.posa_allow_change_posting_date"
+							v-if="pos_profile.posa_allow_change_posting_date || showPriceListDropdown"
 							flat
 							class="invoice-section-card pos-themed-card"
 						>
@@ -93,6 +112,8 @@
 								:balance_loading="customer_balance_loading"
 								:price-list="selected_price_list"
 								:price-lists="price_lists"
+								:show-price-list="showPriceListDropdown"
+								:price-list-disabled="!canSelectPriceList || priceListSwitching"
 								:formatCurrency="formatCurrency"
 								:currencySymbol="currencySymbol"
 								@update:posting_date_display="
@@ -100,11 +121,7 @@
 										posting_date_display = val;
 									}
 								"
-								@update:priceList="
-									(val) => {
-										selected_price_list = val;
-									}
-								"
+								@update:priceList="selectPriceList"
 							/>
 						</v-card>
 
@@ -185,6 +202,7 @@
 								:calcUom="calc_uom"
 								:setSerialNo="set_serial_no"
 								:setBatchQty="set_batch_qty"
+								:refreshBatchSerialData="refreshBatchSerialData"
 								:validateDueDate="validate_due_date"
 								:removeItem="remove_item"
 								:subtractOne="subtract_one"
@@ -192,7 +210,9 @@
 								:toggleOffer="toggleOffer"
 								:changePriceListRate="change_price_list_rate"
 								:isNegative="isNegative"
+								:counter-grid="isCounterGridPresentation"
 								@update:expanded="handleExpandedUpdate"
+								@batch-serial-changed="handleBatchSerialChanged"
 								@reorder-items="handleItemReorder"
 								@add-item-from-drag="handleItemDrop"
 								@show-drop-feedback="
@@ -200,6 +220,7 @@
 								"
 								@item-dropped="showDropFeedback(false, itemsTableRef)"
 								@view-packed="openPackedItems"
+								@edit-item="openItemQuickEditForItem"
 							/>
 
 							<PackedItemsDialog
@@ -235,23 +256,37 @@
 			@submit="handlePriceListRateDialogSubmit"
 			@cancel="handlePriceListRateDialogCancel"
 		/>
+		<ItemQuickEditDialog
+			v-model="item_quick_edit_open"
+			:item-code="item_quick_edit_item_code"
+			:pos-profile="pos_profile"
+			:cashier="currentCashier?.user"
+			:is-online="isOnline"
+			@saved="handleItemQuickEditSaved"
+			@after-leave="focusItemSearchField"
+		/>
 
 		<!-- Payment Section -->
 		<InvoiceSummary
 			ref="invoiceSummary"
+			:presentation="presentation"
 			:pos_profile="pos_profile"
 			:total_qty="total_qty"
 			:additional_discount="additional_discount"
 			:additional_discount_percentage="additional_discount_percentage"
 			:total_items_discount_amount="total_items_discount_amount"
+			:grossTotal="Total"
 			:subtotal="subtotal"
 			:displayCurrency="displayCurrency"
+			:currency-precision="currency_precision"
 			:formatFloat="formatFloat"
 			:formatCurrency="formatCurrency"
 			:currencySymbol="currencySymbol"
 			:discount_percentage_offer_name="discount_percentage_offer_name"
 			:isNumber="isNumber"
 			:return_discount_meta="return_discount_meta"
+			:exchange-session="exchangeSession"
+			:exchange-continuing="exchangeContinuing"
 			@update:additional_discount="(val) => (additional_discount = val)"
 			@update:additional_discount_percentage="(val) => (additional_discount_percentage = val)"
 			@update_discount_umount="update_discount_umount"
@@ -264,7 +299,11 @@
 			@print-draft="print_draft_invoice"
 			@show-payment="handleShowPaymentRequest"
 			@open-customer-display="handleOpenCustomerDisplayRequest"
+			@open-offers="handleOpenCounterAuxiliary('offers')"
+			@open-coupons="handleOpenCounterAuxiliary('coupons')"
 			@resume-parked-order="resume_parked_order"
+			@continue-exchange="continueExchangeToSale"
+			@cancel-exchange="cancelExchange"
 		/>
 	</div>
 </template>
@@ -282,25 +321,34 @@ import InvoiceItemsActionToolbar from "./invoice/InvoiceItemsActionToolbar.vue";
 import PackedItemsDialog from "./invoice/PackedItemsDialog.vue";
 import PaymentConfirmationDialog from "./payments/PaymentConfirmationDialog.vue";
 import PriceListRateDialog from "./invoice/PriceListRateDialog.vue";
+import ItemQuickEditDialog from "./items/ItemQuickEditDialog.vue";
+import { resolveItemQuickEditCodeFromRows } from "./invoice/itemQuickEditSelection";
 import invoiceItemMethods from "./invoice/invoiceItemMethods";
 import invoiceComputed from "./invoice/invoiceComputed";
 import invoiceWatchers from "./invoice/invoiceWatchers";
 import shortcutMethods from "./invoice/invoiceShortcuts";
 import { useInvoiceStore } from "../../stores/invoiceStore.js";
+import { useItemsStore } from "../../stores/itemsStore";
 import { useCustomersStore } from "../../stores/customersStore.js";
+import { useEmployeeStore } from "../../stores/employeeStore";
 import { useToastStore } from "../../stores/toastStore.js";
 import { useUIStore } from "../../stores/uiStore.js";
 import { storeToRefs } from "pinia";
 import stockCoordinator from "../../utils/stockCoordinator";
-import { getCurrentInstance, ref } from "vue";
+import { parseBooleanSetting } from "../../utils/stock";
+import { getCurrentInstance, nextTick, ref } from "vue";
 import { save_and_clear_invoice as saveAndClearInvoiceAction } from "./invoice_utils/actions";
+import { prepareCartPriceListChange, warnMissingPriceListRates } from "./invoice_utils/item_updates";
 import { fetchDraftInvoices } from "../../utils/draftInvoices";
 import { getQuickCashTenderSuggestions } from "../../utils/cashTender";
+import invoiceService from "../../services/invoiceService";
 
 // Composables
 import { useOnlineStatus } from "../../composables/core/useOnlineStatus";
 import { useInvoiceCurrency } from "../../composables/pos/invoice/useInvoiceCurrency";
 import { useInvoiceItems } from "../../composables/pos/invoice/useInvoiceItems";
+import { startCartRecovery } from "../../composables/pos/invoice/useCartRecovery";
+import SavedCartRecovery from "./invoice/SavedCartRecovery.vue";
 import { useInvoiceOffers } from "../../composables/pos/invoice/useInvoiceOffers";
 import { useInvoiceUI } from "../../composables/pos/invoice/useInvoiceUI";
 import { useInvoicePrinting } from "../../composables/pos/invoice/useInvoicePrinting";
@@ -320,16 +368,25 @@ import {
 export default {
 	name: "POSInvoice",
 	mixins: [format],
+	props: {
+		presentation: {
+			type: String,
+			default: "classic",
+		},
+	},
 	setup() {
 		const instance = getCurrentInstance();
 		const uiStore = useUIStore();
 		const invoiceStore = useInvoiceStore();
+		const itemsStore = useItemsStore();
 		const customersStore = useCustomersStore();
+		const employeeStore = useEmployeeStore();
 		const toastStore = useToastStore();
 		const { isOnline } = useOnlineStatus();
 
 		const { activeView, posProfile: livePosProfile } = storeToRefs(uiStore);
 		const { selectedCustomer, refreshToken: customerRefreshToken } = storeToRefs(customersStore);
+		const { currentCashier } = storeToRefs(employeeStore);
 		const {
 			items,
 			packedItems: packed_items,
@@ -337,6 +394,7 @@ export default {
 			invoiceType,
 			flowToLoad,
 			flowContext,
+			exchangeSession,
 		} = storeToRefs(invoiceStore);
 		const itemsTableRef = ref(null);
 		const currencyState = useInvoiceCurrency({}, {});
@@ -370,12 +428,16 @@ export default {
 			isOnline,
 			toastStore,
 			invoiceStore,
+			itemsStore,
+			employeeStore,
 			customersStore,
+			currentCashier,
 			selectedCustomer,
 			customerRefreshToken,
 			invoiceType,
 			flowToLoad,
 			flowContext,
+			exchangeSession,
 			itemsTableRef,
 			...currencyState,
 			...itemActions,
@@ -387,6 +449,11 @@ export default {
 	},
 	data() {
 		return {
+			cartRecoveryError: "",
+			cartRecoveryMessage: "",
+			cartRecoveryCandidates: [],
+			cartRecoveryReviewWarning: "",
+			cartRecoveryBusy: false,
 			is_sharing: false,
 			pos_profile: "",
 			pos_opening_shift: "",
@@ -394,7 +461,9 @@ export default {
 			return_doc: "",
 			customer: "",
 			customer_info: "",
-			customer_balance: 0,
+			manualPriceList: "",
+			priceListSwitching: false,
+			customer_balance: null,
 			customer_balance_currency: undefined,
 			customer_balance_loading: false,
 			total_tax: 0,
@@ -427,10 +496,16 @@ export default {
 			price_list_rate_dialog_initial_rate: "",
 			price_list_rate_dialog_item_label: "",
 			price_list_rate_dialog_resolver: null,
+			item_quick_edit_open: false,
+			item_quick_edit_item_code: "",
+			exchangeContinuing: false,
+			exchangeRecoveryKey: "",
+			exchangeDraftPersistTimer: null,
 		};
 	},
 
 	components: {
+		SavedCartRecovery,
 		InvoiceCustomerSection,
 		DeliveryCharges,
 		PostingDateRow,
@@ -442,8 +517,12 @@ export default {
 		PackedItemsDialog,
 		PaymentConfirmationDialog,
 		PriceListRateDialog,
+		ItemQuickEditDialog,
 	},
 	computed: {
+		isCounterGridPresentation() {
+			return this.presentation === "counter-grid";
+		},
 		items: {
 			get() {
 				return this.invoiceStore.items;
@@ -470,6 +549,26 @@ export default {
 		},
 		paymentVisible() {
 			return this.activeView === "payment" || this.uiStore.paymentDialogOpen;
+		},
+		showPriceListDropdown() {
+			return parseBooleanSetting(this.pos_profile?.posa_enable_price_list_dropdown);
+		},
+		canSelectPriceList() {
+			return (
+				this.showPriceListDropdown &&
+				this.isOnline &&
+				!this.itemsStore.isLoading &&
+				this.invoiceType === "Invoice" &&
+				!this.isReturnInvoice &&
+				!this.exchangeSession &&
+				!this.paymentVisible &&
+				!this._suppressClosePayments &&
+				!this.invoice_doc?.name &&
+				!this.cartRecoveryBusy &&
+				(!this.customer || this.customer_info?.name === this.customer) &&
+				!this.customer_info?.customer_price_list &&
+				!this.customer_info?.customer_group_price_list
+			);
 		},
 		discount_amount: {
 			get() {
@@ -541,6 +640,8 @@ export default {
 	},
 
 	methods: {
+		recoverSavedCart(key) { return this._cartRecovery?.recoverSavedCart(key); },
+		refreshSavedCarts() { return this._cartRecovery?.refreshCandidates(); },
 		formatDateForDisplay(date) {
 			if (!date) return "";
 			const parts = date.split("-");
@@ -559,7 +660,25 @@ export default {
 		},
 
 		focusItemSearchField() {
+			if (this.isCounterGridPresentation) {
+				return this.focusCounterGridEntry();
+			}
 			this.uiStore.triggerItemSearchFocus();
+		},
+
+		focusCounterGridEntry() {
+			return this.$refs.itemsTableRef?.focusCounterGridEntry?.();
+		},
+
+		clearCounterGridEntry() {
+			return this.$refs.itemsTableRef?.clearCounterGridEntry?.();
+		},
+
+		async focusMissingPriceListItem(item) {
+			this.itemSearch = "";
+			await nextTick();
+			const index = this.items.indexOf(item);
+			if (index >= 0) await this.$refs.itemsTableRef?.focusMissingRateRow?.(index);
 		},
 
 		focusCartItemQty(payload = {}) {
@@ -596,6 +715,91 @@ export default {
 			this.$refs.invoiceSummary?.focusAdditionalDiscountField?.();
 		},
 
+		handleOpenCounterAuxiliary(view) {
+			if (!this.isCounterGridPresentation || !["offers", "coupons"].includes(view)) {
+				return;
+			}
+			this.uiStore.setActiveView(view);
+		},
+
+		resolveItemQuickEditCode() {
+			return resolveItemQuickEditCodeFromRows(this.$refs.itemsTableRef, this.items);
+		},
+
+		openItemQuickEdit() {
+			this.item_quick_edit_item_code = this.resolveItemQuickEditCode();
+			this.item_quick_edit_open = true;
+		},
+
+		openItemWorkspace() {
+			const opened = this.$refs.itemsTableRef?.openSelectedItemWorkspace?.();
+			if (!opened) {
+				this.toastStore.show({
+					title: __("Select an invoice item first"),
+					color: "warning",
+				});
+				this.focusItemSearchField?.();
+			}
+			return opened;
+		},
+
+		openItemQuickEditForItem(item = {}) {
+			this.item_quick_edit_item_code = item?.item_code || this.resolveItemQuickEditCode();
+			this.item_quick_edit_open = true;
+		},
+
+		handleItemQuickEditSaved(payload = {}) {
+			const updatedItem = payload?.pos_item || payload?.item;
+			if (updatedItem?.item_code) {
+				this.itemsStore?.upsertCatalogItem?.(updatedItem);
+			}
+
+			const masterItem = payload?.item || {};
+			const itemCode = updatedItem?.item_code || masterItem?.item_code;
+			if (!itemCode) {
+				return;
+			}
+
+			const retailPrice =
+				updatedItem?.rate ?? updatedItem?.price_list_rate ?? masterItem?.retail_price ?? null;
+			const rows = Array.isArray(this.items) ? this.items : [];
+			rows.forEach((row) => {
+				if (row?.item_code !== itemCode || !row?.posa_row_id) {
+					return;
+				}
+				this.invoiceStore.updateItemWithTotals(row.posa_row_id, (existing) => {
+					const previousQty = row.qty;
+					const previousDiscountPercentage = row.discount_percentage;
+					const previousDiscountAmount = row.discount_amount;
+					Object.assign(existing, masterItem, updatedItem, {
+						posa_row_id: row.posa_row_id,
+						qty: previousQty,
+						discount_percentage: previousDiscountPercentage,
+						discount_amount: previousDiscountAmount,
+					});
+					if (masterItem.retailmind_non_discountable || updatedItem?.retailmind_non_discountable) {
+						existing.discount_percentage = 0;
+						existing.discount_amount = 0;
+					}
+					const keepManualRate =
+						row._manual_rate_set ||
+						row.posa_is_offer ||
+						row.posa_offer_applied ||
+						row.posa_is_replace;
+					if (!keepManualRate && retailPrice !== null && retailPrice !== undefined) {
+						existing.price_list_rate = Number(retailPrice) || 0;
+						existing.rate = Number(retailPrice) || 0;
+						existing.amount = (Number(existing.qty) || 0) * existing.rate;
+					}
+				});
+			});
+			this.invoiceStore.triggerUpdateTotals?.();
+			this.toastStore.show({
+				title: __("Item updated"),
+				color: "success",
+			});
+		},
+
 		handleStockCoordinatorUpdate(event = {}) {
 			const codes = Array.isArray(event.codes) ? event.codes : [];
 			if (!codes.length) return;
@@ -622,6 +826,37 @@ export default {
 
 		handleExpandedUpdate(ids) {
 			this.expanded = Array.isArray(ids) ? ids.slice(-1) : [];
+		},
+
+		handleBatchSerialChanged(item) {
+			if (this._mergeIndexCache) {
+				this._mergeIndexCache.signature = -1;
+				this._mergeIndexCache.lastItems = null;
+				this._mergeIndexCache.lastOrder = null;
+			}
+			this.invoiceStore?.recalculateTotals?.();
+			this.triggerBackgroundFlush?.();
+			this.$forceUpdate();
+			this.toastStore.show({
+				title: __("Batch and serial selection updated"),
+				message: item?.item_name || item?.item_code || "",
+				color: "success",
+			});
+		},
+
+		async refreshBatchSerialData(item) {
+			if (!item) return item;
+			await this.update_items_details([item]);
+			if (
+				item.has_batch_no &&
+				item.batch_no &&
+				Array.isArray(item.batch_no_data) &&
+				item.batch_no_data.length > 0
+			) {
+				this.set_batch_qty(item, item.batch_no, false);
+			}
+			this.$forceUpdate();
+			return item;
 		},
 
 		async share_last_invoice() {
@@ -790,6 +1025,65 @@ export default {
 			this.invoiceStore.setPostingDate(date);
 			this.$forceUpdate();
 		},
+		async selectPriceList(priceList) {
+			if (
+				this.priceListSwitching ||
+				!this.canSelectPriceList ||
+				priceList === this.selected_price_list ||
+				!this.price_lists.includes(priceList)
+			) {
+				return;
+			}
+			this.priceListSwitching = true;
+			try {
+				const customer = this.customer;
+				const profile = this.pos_profile;
+				const stillCurrent = () =>
+					this.customer === customer &&
+					this.pos_profile === profile &&
+					this.invoiceType === "Invoice" &&
+					!this.exchangeSession &&
+					!this.paymentVisible &&
+					!this._suppressClosePayments &&
+					!this.cartRecoveryBusy &&
+					!this.customer_info?.customer_price_list &&
+					!this.customer_info?.customer_group_price_list &&
+					!this.invoice_doc?.name;
+				const { message: currency } = await frappe.call({
+					method: "posawesome.posawesome.api.invoices.get_price_list_currency",
+					args: { price_list: priceList },
+				});
+				if (!currency) throw new Error("Selling price list currency is missing");
+				if (!stillCurrent()) return;
+				const cartChange = await prepareCartPriceListChange(this, priceList, currency);
+				const canApply = () => stillCurrent() && cartChange.isCurrent();
+				if (!canApply()) throw new Error("Cart changed while loading prices");
+				let catalogApplied = false;
+				await this.itemsStore.updatePriceList(priceList, {
+					reloadCatalog: true,
+					shouldApply: () => (catalogApplied = canApply()),
+				});
+				if (!catalogApplied && !canApply()) throw new Error("Cart changed while loading prices");
+				this.price_list_currency = currency;
+				this.manualPriceList = priceList;
+				this.selected_price_list = priceList;
+				cartChange.apply();
+				if (cartChange.missingItems.length) {
+					warnMissingPriceListRates(this, cartChange.missingItems);
+				}
+				await nextTick();
+				this.schedulePricingRuleApplication(true);
+			} catch (error) {
+				console.error("Failed to switch selling price list", error);
+				this.toastStore.show({
+					title: __("Unable to change Price List"),
+					text: error instanceof Error ? error.message : undefined,
+					color: "error",
+				});
+			} finally {
+				this.priceListSwitching = false;
+			}
+		},
 
 		update_exchange_rate() {
 			this.sync_exchange_rate();
@@ -856,6 +1150,10 @@ export default {
 		},
 
 		handleRegisterPosProfile(data) {
+			if (this.pos_profile?.name !== data.pos_profile.name) {
+				this.manualPriceList = "";
+				this.selected_price_list = data.pos_profile.selling_price_list;
+			}
 			this.pos_profile = data.pos_profile;
 			this.company = data.company || null;
 			this.customer = data.pos_profile.customer;
@@ -868,6 +1166,131 @@ export default {
 			this.update_price_list();
 			this.fetch_available_currencies();
 			this.refresh_parked_orders();
+			void this.restorePendingExchange();
+		},
+		async restorePendingExchange() {
+			const profileName = this.pos_profile?.name;
+			const openingShiftName = this.pos_opening_shift?.name;
+			if (!profileName || !openingShiftName) return;
+
+			const recoveryKey = [frappe?.session?.user || "", profileName, openingShiftName].join("::");
+			if (this.exchangeRecoveryKey === recoveryKey) return;
+			this.exchangeRecoveryKey = recoveryKey;
+
+			const restored = this.invoiceStore.restoreExchange?.({
+				user: frappe?.session?.user,
+				posProfile: profileName,
+				company: this.pos_profile?.company,
+				openingShift: openingShiftName,
+			});
+			if (!restored) return;
+
+			if (this.isOnline && restored.clientRequestId) {
+				try {
+					const completed = await invoiceService.getExchangeByRequestId(
+						restored.clientRequestId,
+						this.pos_profile,
+					);
+					if (completed) {
+						this.invoiceStore.clearExchange();
+						if (
+							completed.exchange_status !== "Cancelled" &&
+							completed.replacement_invoice
+						) {
+							this.uiStore.setLastInvoice?.(
+								completed.replacement_invoice,
+								completed,
+							);
+						}
+						this.toastStore.show({
+							title:
+								completed.exchange_status === "Cancelled"
+									? __("Recovered exchange was already cancelled")
+									: __("Item exchange was already completed"),
+							text: completed.replacement_invoice
+								? __("Replacement invoice: {0}", [completed.replacement_invoice])
+								: undefined,
+							color: completed.exchange_status === "Cancelled" ? "warning" : "success",
+						});
+						return;
+					}
+				} catch (error) {
+					console.warn("Unable to check recovered item exchange status:", error);
+				}
+			}
+
+			if (this.items.length) {
+				this.invoiceStore.clearExchange();
+				this.toastStore.show({
+					title: __("Saved exchange was not restored"),
+					text: __("The active sale was kept to prevent carts from being mixed."),
+					color: "warning",
+				});
+				return;
+			}
+
+			const draft = restored.stage === "return" ? restored.returnDraft : restored.saleDraft;
+			if (draft) {
+				await this.load_invoice(JSON.parse(JSON.stringify(draft)), {
+					preserveExchange: true,
+				});
+			} else if (restored.stage === "sale" && restored.returnDoc) {
+				await this.load_invoice(
+					{
+						doctype: "Sales Invoice",
+						company: this.pos_profile.company,
+						pos_profile: profileName,
+						customer: restored.returnDoc.customer,
+						currency: restored.returnDoc.currency || this.pos_profile.currency,
+						items: [],
+						packed_items: [],
+					},
+					{ preserveExchange: true },
+				);
+			}
+
+			if (restored.stage === "return") {
+				this.invoiceType = "Return";
+				this.invoiceTypes = ["Return"];
+			} else {
+				this.invoiceType = "Invoice";
+				this.invoiceTypes = ["Invoice"];
+			}
+
+			this.toastStore.show({
+				title: __("Item exchange restored"),
+				text:
+					restored.stage === "return"
+						? __("Review the return items and continue to the replacement sale.")
+						: __("Continue adding replacement items, then collect only the difference."),
+				color: "info",
+			});
+		},
+		scheduleExchangeDraftPersistence() {
+			if (this.exchangeDraftPersistTimer) {
+				clearTimeout(this.exchangeDraftPersistTimer);
+			}
+			this.exchangeDraftPersistTimer = setTimeout(() => {
+				this.exchangeDraftPersistTimer = null;
+				if (!this.exchangeSession) return;
+				const baseDoc = this.invoice_doc || {};
+				const draft = {
+					...JSON.parse(JSON.stringify(baseDoc)),
+					doctype: baseDoc.doctype || "Sales Invoice",
+					company: baseDoc.company || this.pos_profile?.company,
+					pos_profile: baseDoc.pos_profile || this.pos_profile?.name,
+					customer: baseDoc.customer || this.customer,
+					currency: baseDoc.currency || this.selected_currency || this.pos_profile?.currency,
+					items: JSON.parse(JSON.stringify(this.items || [])),
+					packed_items: JSON.parse(JSON.stringify(this.packed_items || [])),
+				};
+				if (this.exchangeSession.stage === "return") {
+					draft.is_return = 1;
+					this.invoiceStore.setExchangeReturnDraft?.(draft);
+				} else {
+					this.invoiceStore.setExchangeSaleDraft?.(draft);
+				}
+			}, 150);
 		},
 		async refresh_parked_orders() {
 			if (!this.pos_profile || !this.pos_opening_shift?.name) {
@@ -885,8 +1308,13 @@ export default {
 				console.error("Error refreshing parked orders:", error);
 			}
 		},
-		handleClearInvoice() {
-			this.clear_invoice();
+		handleClearInvoice(options = {}) {
+			this.clear_invoice(options);
+			if (options.resetCurrency && typeof this.reset_currency_to_default === "function") {
+				this.reset_currency_to_default().catch((error) => {
+					console.error("Unable to reset invoice currency:", error);
+				});
+			}
 			this.uiStore.triggerItemSearchFocus();
 		},
 		handleLoadInvoice(data) {
@@ -959,22 +1387,37 @@ export default {
 		},
 		handleLoadReturnInvoice(data) {
 			this.load_invoice(data.invoice_doc);
+			if (data.exchange_mode) {
+				this.invoiceStore.startExchange({
+					originalInvoice: data.return_doc,
+					returnDraft: data.invoice_doc,
+					clientRequestId:
+						typeof crypto !== "undefined" && crypto.randomUUID
+							? crypto.randomUUID()
+							: `exchange-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+					posProfile: this.pos_profile?.name,
+					company: this.pos_profile?.company,
+					openingShift: this.pos_opening_shift?.name,
+					user: frappe?.session?.user,
+				});
+			}
 			this.invoiceType = "Return";
 			this.invoiceTypes = ["Return"];
 			this.invoice_doc.is_return = 1;
-			// Cap on cash refundable for this return = amount actually paid on the
-			// original invoice. 0 for an unpaid/credit invoice, so the payment screen
-			// defaults to no cash refund and the return becomes a credit note that
-			// reduces the customer's balance. Derived here so it covers every entry
-			// point that loads a return (returns dialog + invoice management).
+			// Cap on cash refundable for this return. The backend
+			// (get_invoice_for_return) computes it authoritatively as
+			// grand_total - outstanding - returns-already-issued; use that value.
+			// Covers every entry point that loads a return (returns dialog + invoice
+			// management). Falls back to grand - outstanding only if neither the
+			// carried value nor the backend field is present (e.g. older payload).
 			{
 				const od = data.invoice_doc || {};
 				const rd = data.return_doc || {};
 				let refundable =
 					od.posa_refundable_amount != null
 						? od.posa_refundable_amount
-						: rd.paid_amount != null
-							? rd.paid_amount
+						: rd.posa_refundable_amount != null
+							? rd.posa_refundable_amount
 							: (rd.grand_total || 0) - (rd.outstanding_amount || 0);
 				refundable = this.flt(refundable, this.currency_precision);
 				this.invoice_doc.posa_refundable_amount = refundable > 0 ? refundable : 0;
@@ -1038,6 +1481,56 @@ export default {
 				this.additional_discount_percentage = 0;
 			}
 		},
+		async continueExchangeToSale() {
+			if (!this.exchangeSession || this.exchangeSession.stage !== "return") return;
+			if (!this.isOnline) {
+				this.toastStore.show({
+					title: __("Item exchanges require an online connection."),
+					color: "error",
+				});
+				return;
+			}
+			if (!this.items.length) {
+				this.toastStore.show({ title: __("Select at least one item to return."), color: "error" });
+				return;
+			}
+
+			this.exchangeContinuing = true;
+			try {
+				if (this.ensure_auto_batch_selection) await this.ensure_auto_batch_selection();
+				if (this.validate && !(await this.validate())) return;
+
+				const customer = this.customer || this.invoice_doc?.customer;
+				const returnDoc = this.get_invoice_doc();
+				returnDoc.is_return = 1;
+				returnDoc.is_pos = 0;
+				returnDoc.payments = (returnDoc.payments || []).map((payment) => ({
+					...payment,
+					amount: 0,
+					base_amount: 0,
+				}));
+				this.invoiceStore.setExchangeReturn(returnDoc);
+
+				this.clear_invoice({ preserveExchange: true });
+				this.customer = customer;
+				this.customersStore.setSelectedCustomer?.(customer);
+				this.invoiceType = "Invoice";
+				this.invoiceTypes = ["Invoice"];
+				this.toastStore.show({
+					title: __("Return credit captured. Add the replacement items."),
+					color: "success",
+				});
+				this.uiStore.triggerItemSearchFocus?.();
+			} finally {
+				this.exchangeContinuing = false;
+			}
+		},
+		cancelExchange() {
+			this.invoiceStore.clearExchange();
+			this.clear_invoice();
+			this.invoiceTypes = ["Invoice", "Order", "Quotation"];
+			this.toastStore.show({ title: __("Exchange cancelled."), color: "info" });
+		},
 		handleSetNewLine(data) {
 			this.new_line = data;
 		},
@@ -1100,16 +1593,17 @@ export default {
 		this.setUpdateItemDetail(this.update_item_detail);
 		this.loadColumnPreferences();
 		this.loadInvoiceHeight();
+		this._cartRecovery = startCartRecovery(this);
 
 		this.$watch(
-			() => this.uiStore.posProfile,
-			(profile) => {
-				if (profile && profile.name) {
+			() => [this.uiStore.posProfile, this.uiStore.posOpeningShift],
+			([profile, openingShift]) => {
+				if (profile?.name) {
 					this.handleRegisterPosProfile({
 						pos_profile: profile,
 						stock_settings: this.uiStore.stockSettings,
 						company: this.uiStore.companyDoc,
-						pos_opening_shift: this.uiStore.posOpeningShift,
+						pos_opening_shift: openingShift,
 					});
 				}
 			},
@@ -1177,6 +1671,11 @@ export default {
 			{ immediate: true },
 		);
 
+		this.$watch(
+			() => this.invoiceStore.metadata.changeVersion,
+			() => this.scheduleExchangeDraftPersistence(),
+		);
+
 		this._busHandlers = {
 			add_item: this.add_item,
 			clear_invoice: this.handleClearInvoice,
@@ -1233,6 +1732,10 @@ export default {
 			clearTimeout(this._suppressClosePaymentsTimer);
 			this._suppressClosePaymentsTimer = null;
 		}
+		if (this.exchangeDraftPersistTimer) {
+			clearTimeout(this.exchangeDraftPersistTimer);
+			this.exchangeDraftPersistTimer = null;
+		}
 	},
 	created() {
 		this.invoiceStore.clear();
@@ -1265,6 +1768,7 @@ export default {
 		registerInvoiceShortcutListener(document, this._shortcutHandlers.handleInvoiceShortcut);
 	},
 	unmounted() {
+		this._cartRecovery?.stop();
 		if (!this._shortcutHandlers) {
 			return;
 		}
@@ -1301,6 +1805,127 @@ export default {
 	flex: 1 1 auto;
 	min-height: 0;
 	overflow: auto;
+}
+
+.invoice-shell--counter-grid {
+	--counter-rugged-navy: #09253d;
+	--counter-rugged-navy-raised: #174a70;
+	--counter-rugged-blue: #0f70d7;
+	--counter-rugged-cyan: #38bdf8;
+	--counter-rugged-line: var(--pos-outline);
+	--counter-rugged-soft-line: var(--pos-border);
+	--counter-rugged-surface: var(--pos-card-bg);
+	--counter-rugged-muted: var(--pos-surface-muted);
+	height: 100%;
+	width: min(100%, 1560px);
+	margin-inline: auto;
+	overflow: hidden;
+	gap: 8px;
+}
+
+.invoice-shell--counter-grid .invoice-main-card--counter-grid {
+	flex: 1 1 0;
+	height: auto !important;
+	max-height: none !important;
+	min-height: 0;
+	margin-top: 0 !important;
+	border: 0;
+	border-radius: 0;
+	background: var(--pos-surface-muted) !important;
+	box-shadow: none;
+	overflow: hidden !important;
+}
+
+.invoice-shell--counter-grid .dynamic-padding {
+	padding: 8px 10px 6px;
+	gap: 8px;
+	overflow: hidden;
+}
+
+.invoice-shell--counter-grid .invoice-sections {
+	gap: 8px;
+	overflow: hidden;
+}
+
+.invoice-shell--counter-grid .invoice-top-grid,
+.invoice-shell--counter-grid .invoice-meta-grid {
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 8px;
+}
+
+.invoice-shell--counter-grid .invoice-section-card {
+	border: 1px solid var(--counter-rugged-line);
+	border-radius: 3px;
+	background: var(--counter-rugged-surface) !important;
+	box-shadow: 0 1px 3px rgba(9, 37, 61, 0.14);
+}
+
+.invoice-shell--counter-grid .invoice-section-heading {
+	display: block;
+	padding: 9px 14px;
+	border-bottom: 1px solid var(--counter-rugged-cyan);
+	background: var(--counter-rugged-navy);
+}
+
+.invoice-shell--counter-grid .invoice-section-heading__title {
+	color: #ffffff;
+	font-size: 0.88rem;
+	font-weight: 800;
+	text-transform: uppercase;
+}
+
+.invoice-shell--counter-grid .invoice-top-grid .invoice-section-heading,
+.invoice-shell--counter-grid .invoice-meta-grid .invoice-section-heading {
+	display: none;
+}
+
+.invoice-shell--counter-grid .invoice-items-card {
+	flex: 1 1 auto;
+	min-height: 0;
+	padding-bottom: 0;
+	border: 2px solid var(--counter-rugged-navy);
+	box-shadow: 0 3px 8px rgba(9, 37, 61, 0.22);
+	overflow: hidden;
+}
+
+.invoice-shell--counter-grid .items-table-wrapper {
+	flex: 1 1 auto;
+	min-height: 0;
+	margin-top: 0;
+	overflow: hidden;
+}
+
+.invoice-shell--counter-grid :deep(.items-table-wrapper .posa-items-table-container) {
+	flex: 1 1 auto;
+	min-height: 0;
+	height: 100% !important;
+	max-height: 100% !important;
+	overflow: auto !important;
+}
+
+.invoice-shell--counter-grid :deep(.items-table-wrapper .column-selector-container) {
+	position: static;
+	min-height: 50px;
+	margin: 0;
+	padding: 6px 10px;
+	border-bottom: 2px solid var(--counter-rugged-cyan);
+	border-radius: 0;
+	background: var(--counter-rugged-navy) !important;
+}
+
+.invoice-shell--counter-grid :deep(.item-search-field .v-field) {
+	border: 1px solid #b8c7d2;
+	border-radius: 3px;
+	background: var(--pos-invoice-bg) !important;
+	box-shadow: inset 0 1px 2px rgba(9, 37, 61, 0.12);
+}
+
+.invoice-shell--counter-grid :deep(.column-selector-btn) {
+	min-height: 36px;
+	border: 1px solid var(--counter-rugged-cyan);
+	border-radius: 3px !important;
+	background: #123b5c !important;
+	color: #ffffff !important;
 }
 
 @media (max-width: 1099px) {

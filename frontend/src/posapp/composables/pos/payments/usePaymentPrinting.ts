@@ -14,6 +14,11 @@ import {
 } from "../../../services/documentPrint";
 import { isOffline } from "../../../../offline/index";
 import { resolvePaymentPrintDoctype } from "../../../utils/paymentPrintDoctype";
+import { printLocalReceipt } from "../../../services/offlineReceiptPrint";
+import {
+	isExchangeReceiptDocument,
+	printExchangeReceipt,
+} from "../../../services/exchangeReceiptPrint";
 
 declare const frappe: any;
 
@@ -84,18 +89,15 @@ export function usePaymentPrinting(options: PaymentPrintingOptions) {
 	};
 
 	const printOfflineInvoice = async (invoice: any) => {
-		if (!invoice) return;
-		const html = await renderOfflineInvoiceHTML(invoice);
-		const win = window.open("", "_blank");
-		if (!win) return;
-		win.document.write(html);
-		win.document.close();
-		win.focus();
-		win.print();
+		await printLocalReceipt(invoice, unref(posProfile));
 	};
 
 	const loadPrintPage = async (input: { doc?: any; doctype?: string; name?: string } = {}) => {
 		const { doc, profile, doctype, print_format, letter_head } = resolvePrintContext(input);
+		if (isExchangeReceiptDocument(doc)) {
+			await printExchangeReceipt(doc, profile);
+			return;
+		}
 		const debugPrint = isDebugPrintEnabled();
 		const offline = isOffline();
 		const docname = resolveDocumentName(input.name || doc?.name);

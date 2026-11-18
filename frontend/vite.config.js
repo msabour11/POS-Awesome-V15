@@ -32,6 +32,10 @@ function posawesomeBuildVersionPlugin(version) {
 
 export default defineConfig({
 	base: "/assets/posawesome/dist/js/",
+	esbuild: {
+		// Keep MDI glyphs as CSS escapes even when a cached stylesheet has no charset.
+		charset: "ascii",
+	},
 	plugins: [
 		posawesomeBuildVersionPlugin(buildVersion),
 		frappeVueStyle(),
@@ -63,7 +67,8 @@ export default defineConfig({
 		},
 	},
 	build: {
-		target: "esnext",
+		target: "chrome109",
+		cssTarget: "chrome109",
 		modulePreload: false,
 		outDir: "../posawesome/public/dist/js",
 		emptyOutDir: true,

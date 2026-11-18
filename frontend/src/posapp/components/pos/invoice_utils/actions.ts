@@ -1,8 +1,9 @@
 import { useItemAddition } from "../../../composables/pos/items/useItemAddition";
 import { get_invoice_doc, get_invoice_items, get_payments } from "./document";
 import { _logPriceListDebug, _buildPriceListSnapshot } from "./currency";
-import { applyReturnDiscountProration } from "./item_updates";
+import { applyReturnDiscountProration, hasMissingPriceListRate, warnMissingPriceListRates } from "./item_updates";
 import { prepareDocumentFlowAction } from "../../../utils/documentSources";
+import { shouldFocusCartQtyAfterItemAdd } from "../../../utils/cartFocusSettings";
 
 declare const __: (_text: string, _args?: any[]) => string;
 declare const frappe: any;
@@ -63,6 +64,13 @@ export function remove_item(context: any, item: any) {
 }
 
 export async function add_item(context: any, item: any, options: any = {}) {
+	if (context.priceListSwitching) {
+		context.toastStore?.show({
+			title: __("Please wait for the Price List to finish changing"),
+			color: "warning",
+		});
+		return;
+	}
 	const { addItem } = getItemAdditionApi();
 	// Build price context for debug
 	const priceContext = {
@@ -85,7 +93,12 @@ export async function add_item(context: any, item: any, options: any = {}) {
 	}
 	applyReturnDiscountProration(context);
 
-	if (res && context.eventBus && typeof context.eventBus.emit === "function") {
+	if (
+		res &&
+		shouldFocusCartQtyAfterItemAdd(context.pos_profile) &&
+		context.eventBus &&
+		typeof context.eventBus.emit === "function"
+	) {
 		const focusedLine: any = res;
 		window.setTimeout(() => {
 			context.eventBus.emit("focus_cart_item_qty", {
@@ -186,6 +199,13 @@ export async function cancel_invoice(context: any) {
 }
 
 export async function save_and_clear_invoice(context: any) {
+	if (context.priceListSwitching) return;
+	const missing = context.items.filter(hasMissingPriceListRate);
+	if (missing.length) {
+		warnMissingPriceListRates(context, missing);
+		context.focusMissingPriceListItem?.(missing[0]);
+		return;
+	}
 	const { clearInvoice } = getItemAdditionApi();
 	let old_invoice = null;
 	const doc = get_invoice_doc(context);

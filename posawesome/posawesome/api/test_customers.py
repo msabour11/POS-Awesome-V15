@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -117,6 +118,183 @@ class TestCustomersApi(unittest.TestCase):
         self.assertNotIn("loyalty_points", rows[0])
         self.assertNotIn("conversion_factor", rows[0])
         self.assertEqual(self.state["loyalty_detail_calls"], 0)
+
+    def test_duplicate_customer_lookup_reports_matching_fields(self):
+        def get_all(doctype, **kwargs):
+            filters = kwargs.get("filters", {})
+            if doctype != "Customer":
+                return []
+            if filters.get("mobile_no") == "+92 300 1234567":
+                return [
+                    AttrDict(
+                        name="CUST-EXISTING",
+                        customer_name="Existing Customer",
+                        mobile_no="+92 300 1234567",
+                        email_id="existing@example.com",
+                        tax_id="TIN-1",
+                    )
+                ]
+            if filters.get("email_id") == "existing@example.com":
+                return [
+                    AttrDict(
+                        name="CUST-EXISTING",
+                        customer_name="Existing Customer",
+                        mobile_no="+92 300 1234567",
+                        email_id="existing@example.com",
+                        tax_id="TIN-1",
+                    )
+                ]
+            return []
+
+        self.module.frappe.get_all = get_all
+        matches = self.module._find_duplicate_customer_records(
+            customer_name="Different Name",
+            mobile_no="+92 300 1234567",
+            email_id="Existing@Example.com",
+            allow_duplicate_names=True,
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["name"], "CUST-EXISTING")
+        self.assertEqual(matches[0]["matching_fields"], ["mobile_no", "email_id"])
+
+    def test_mobile_search_matches_local_and_country_code_formats(self):
+        self.assertTrue(
+            self.module._mobile_matches_search("+92 300-1234567", "03001234567")
+        )
+        self.assertFalse(
+            self.module._mobile_matches_search("+92 300-1234567", "03111234567")
+        )
+
+    def test_server_mobile_search_respects_profile_filters_and_normalizes_numbers(self):
+        def get_all(doctype, **kwargs):
+            if doctype != "Customer":
+                return []
+            self.assertEqual(kwargs["filters"]["disabled"], 0)
+            self.assertEqual(
+                kwargs["filters"]["customer_group"], ["in", ["Retail"]]
+            )
+            self.assertIn(
+                ["mobile_no", "like", "%4567%"],
+                kwargs["or_filters"],
+            )
+            return [
+                AttrDict(
+                    name="CUST-EXISTING",
+                    customer_name="Existing Customer",
+                    mobile_no="+92 300-1234567",
+                ),
+                AttrDict(
+                    name="CUST-OTHER",
+                    customer_name="Other Customer",
+                    mobile_no="+92 311-1234567",
+                ),
+            ]
+
+        self.module.frappe.get_all = get_all
+        self.module.get_customer_groups = lambda profile: ["Retail"]
+        matches = self.module.search_customers(
+            json.dumps({"name": "POS-TEST"}), "03001234567"
+        )
+
+        self.assertEqual([match["name"] for match in matches], ["CUST-EXISTING"])
+
+    def test_server_search_finds_normalized_tax_id(self):
+        def get_all(doctype, **kwargs):
+            if doctype != "Customer":
+                return []
+            self.assertIn(
+                ["tax_id", "like", "%6789%"],
+                kwargs["or_filters"],
+            )
+            return [
+                AttrDict(
+                    name="CUST-TAX",
+                    customer_name="Tax Customer",
+                    mobile_no=None,
+                    tax_id="12-345 6789",
+                )
+            ]
+
+        self.module.frappe.get_all = get_all
+        matches = self.module.search_customers(
+            json.dumps({"name": "POS-TEST"}), "123456789"
+        )
+
+        self.assertEqual([match["name"] for match in matches], ["CUST-TAX"])
+
+
+class TestCustomerBalance(unittest.TestCase):
+    def setUp(self):
+        self._orig_sys_modules = sys.modules.copy()
+        _install_stubs()
+        self.module = _load_module()
+        self.module.frappe.db.get_value = Mock(return_value="Test Customer")
+        self.module.frappe.log_error = Mock()
+        self.module.frappe.get_traceback = lambda: "synthetic traceback"
+        party = types.ModuleType("erpnext.accounts.party")
+        self.dashboard = Mock()
+        party.get_dashboard_info = self.dashboard
+        sys.modules["erpnext.accounts.party"] = party
+
+    def tearDown(self):
+        sys.modules.clear()
+        sys.modules.update(self._orig_sys_modules)
+
+    def test_unavailable_native_summary_does_not_disclose_customer_name(self):
+        self.dashboard.return_value = None
+
+        result = self.module.get_customer_balance("CUST-A", "Company A")
+
+        self.assertEqual(result, {
+            "balance": None, "customer_name": None, "currency": None,
+        })
+        self.dashboard.assert_called_once_with("Customer", "CUST-A")
+        self.module.frappe.log_error.assert_not_called()
+
+    def test_native_zero_positive_and_negative_balances_are_preserved(self):
+        for balance in (0, 125.5, -42.25):
+            with self.subTest(balance=balance):
+                self.dashboard.return_value = [
+                    {"company": "Other Company", "total_unpaid": 999, "currency": "EUR"},
+                    {"company": "Company A", "total_unpaid": balance, "currency": "USD"},
+                ]
+                self.assertEqual(
+                    self.module.get_customer_balance("CUST-A", "Company A"),
+                    {"balance": balance, "customer_name": "Test Customer", "currency": "USD"},
+                )
+
+    def test_missing_company_summary_is_unavailable(self):
+        for summary in ([], [{"company": "Other Company", "total_unpaid": 999}]):
+            with self.subTest(summary=summary):
+                self.dashboard.return_value = summary
+                self.assertEqual(
+                    self.module.get_customer_balance("CUST-A", "Company A"),
+                    {"balance": None, "customer_name": "Test Customer", "currency": None},
+                )
+        self.module.frappe.log_error.assert_not_called()
+
+    def test_missing_company_balance_is_not_an_explicit_zero(self):
+        self.dashboard.return_value = [{"company": "Company A", "currency": "USD"}]
+        self.assertEqual(
+            self.module.get_customer_balance("CUST-A", "Company A"),
+            {"balance": None, "customer_name": "Test Customer", "currency": "USD"},
+        )
+
+    def test_unexpected_native_failure_is_logged_and_unavailable(self):
+        self.dashboard.side_effect = RuntimeError("synthetic failure")
+        self.assertEqual(
+            self.module.get_customer_balance("CUST-A", "Company A"),
+            {"balance": None, "customer_name": None, "currency": None},
+        )
+        self.module.frappe.log_error.assert_called_once()
+
+    def test_no_customer_is_unavailable_without_querying_native_summary(self):
+        self.assertEqual(
+            self.module.get_customer_balance(None, "Company A"),
+            {"balance": None, "customer_name": None, "currency": None},
+        )
+        self.dashboard.assert_not_called()
 
 
 if __name__ == "__main__":

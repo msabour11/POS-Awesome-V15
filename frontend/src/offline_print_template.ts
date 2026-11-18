@@ -4,6 +4,7 @@ import {
 	memoryInitPromise,
 } from "./offline/index";
 import nunjucks from "nunjucks";
+import { sanitizePrintHtml } from "./posapp/utils/sanitizePrintHtml";
 
 declare const frappe: any;
 
@@ -99,6 +100,28 @@ function defaultOfflineHTML(invoice: any, terms = "") {
                 <td style="width:40%; text-align:right;">${invoice.change_amount}</td>
             </tr>`
 		: "";
+	const paymentRows = (invoice.payments || [])
+		.filter(
+			(row: any) =>
+				Number(row?.amount || row?.posa_original_amount || 0) !== 0,
+		)
+		.map((row: any) => {
+			const paymentCurrency =
+				row.posa_payment_currency || invoice.currency || "";
+			const original = row.posa_original_amount ?? row.amount;
+			const equivalent =
+				paymentCurrency !== invoice.currency
+					? ` <small>(${row.amount} ${invoice.currency || ""})</small>`
+					: "";
+			return `<tr><td>${row.mode_of_payment || "Payment"} (${paymentCurrency})</td><td style="text-align:right">${original}${equivalent}</td></tr>`;
+		})
+		.join("");
+	const physicalChangeRows = (invoice.posa_change_returns || [])
+		.map(
+			(row: any) =>
+				`<tr><td>Change (${row.currency || ""})</td><td style="text-align:right">${row.original_amount}</td></tr>`,
+		)
+		.join("");
 
 	const termsSection = terms
 		? `<div class="terms"><strong>Terms & Conditions</strong><div>${terms}</div></div>`
@@ -162,13 +185,23 @@ function defaultOfflineHTML(invoice: any, terms = "") {
                 <td style="width:60%">Paid</td>
                 <td style="width:40%; text-align:right;">${paidAmount}</td>
             </tr>
-            ${changeRow}
+			${changeRow}
+			${paymentRows}
+			${physicalChangeRows}
         </tbody>
     </table>
     ${termsSection}
     <div class="footer">Thank you, please visit again.</div>
 </body>
 </html>`;
+}
+
+export function prepareOfflinePrintDocument(invoice: any) {
+	const doc = JSON.parse(JSON.stringify(invoice));
+	delete doc._posa_offline_cashier_token;
+	delete doc._posa_authoritative_cashier;
+	doc.paid_amount = computePaidAmount(doc);
+	return doc;
 }
 
 export default async function renderOfflineInvoiceHTML(invoice: any) {
@@ -179,12 +212,32 @@ export default async function renderOfflineInvoiceHTML(invoice: any) {
 	const template = normaliseTemplate(getPrintTemplate());
 	const terms = getTermsAndConditions();
 	const doc = {
-		...invoice,
+		...prepareOfflinePrintDocument(invoice),
 		terms: invoice.terms || terms,
 		terms_and_conditions: invoice.terms_and_conditions || terms,
 	};
 
-	doc.paid_amount = computePaidAmount(doc);
+	const finishHTML = (html: string) => {
+		if (doc._posa_receipt_label) {
+			const escape = (value: unknown) =>
+				String(value ?? "").replace(
+					/[&<>"']/g,
+					(char) =>
+						({
+							"&": "&amp;",
+							"<": "&lt;",
+							">": "&gt;",
+							'"': "&quot;",
+							"'": "&#39;",
+						})[char]!,
+				);
+			const banner = `<section style="border:1px solid #555;padding:8px;margin-bottom:8px"><strong>${escape(doc._posa_receipt_label)}</strong><div>Request: ${escape(doc.posa_client_request_id)}</div></section>`;
+			html = /<body\b[^>]*>/i.test(html)
+				? html.replace(/<body\b[^>]*>/i, (body) => body + banner)
+				: banner + html;
+		}
+		return sanitizePrintHtml(html);
+	};
 	attachFormatter(doc);
 	(doc.items || []).forEach(attachFormatter);
 	(doc.taxes || []).forEach(attachFormatter);
@@ -193,11 +246,11 @@ export default async function renderOfflineInvoiceHTML(invoice: any) {
 		console.warn(
 			"No offline print template cached; using fallback template",
 		);
-		return defaultOfflineHTML(doc, doc.terms_and_conditions);
+		return finishHTML(defaultOfflineHTML(doc, doc.terms_and_conditions));
 	}
 
 	try {
-		const env = nunjucks.configure({ autoescape: false });
+		const env = nunjucks.configure({ autoescape: true });
 		env.addFilter("format_currency", (value: unknown, currency: string) => {
 			const number =
 				typeof value === "number" ? value : parseFloat(String(value));
@@ -228,9 +281,9 @@ export default async function renderOfflineInvoiceHTML(invoice: any) {
 				get_list: () => [],
 			},
 		};
-		return env.renderString(template, context);
+		return finishHTML(env.renderString(template, context));
 	} catch (e) {
 		console.error("Failed to render offline invoice", e);
-		return defaultOfflineHTML(doc, doc.terms_and_conditions);
+		return finishHTML(defaultOfflineHTML(doc, doc.terms_and_conditions));
 	}
 }

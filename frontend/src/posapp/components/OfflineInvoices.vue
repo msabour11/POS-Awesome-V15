@@ -47,14 +47,14 @@
 						</div>
 						<div class="header-close-section">
 							<v-btn
-								icon="mdi-close"
+								icon
 								variant="text"
 								size="large"
-								color="error"
 								class="header-close-btn"
 								@click="dialog = false"
 								:aria-label="__('Close offline invoices dialog')"
 							>
+								<v-icon icon="mdi-close" size="26" aria-hidden="true" />
 								<v-tooltip activator="parent" location="bottom">
 									{{ __("Close Dialog") }}
 								</v-tooltip>
@@ -67,6 +67,14 @@
 
 				<v-card-text class="pa-0 white-background">
 					<v-container fluid class="pa-6">
+						<v-alert
+							v-if="operationError"
+							type="error"
+							variant="tonal"
+							class="mb-3"
+							data-test="invoice-recovery-error"
+							>{{ operationError }}</v-alert
+						>
 						<!-- Enhanced Empty State -->
 						<div v-if="!invoices.length" class="empty-state text-center py-12">
 							<div class="empty-icon-wrapper mb-4">
@@ -84,16 +92,29 @@
 
 						<!-- Enhanced Invoices Table -->
 						<div v-else class="table-container">
+							<v-text-field
+								v-model="search"
+								:label="__('Search customer, invoice or status')"
+								prepend-inner-icon="mdi-magnify"
+								clearable
+								hide-details
+								class="mb-3"
+							/>
 							<div class="table-header mb-4">
 								<h4 class="text-h6 text-grey-darken-2 mb-1">{{ __("Pending Invoices") }}</h4>
 								<p class="text-body-2 text-grey">
-									{{ __("These invoices will be synced when connection is restored") }}
+									{{
+										__(
+											"Failed invoices remain here for review. Correct the error and retry using the original request.",
+										)
+									}}
 								</p>
 							</div>
 
 							<v-data-table
 								:headers="headers"
-								:items="invoices"
+								:items="visibleInvoices"
+								item-value="request_id"
 								class="elevation-0 rounded-lg white-table"
 								:items-per-page="15"
 								:items-per-page-options="[15, 25, 50]"
@@ -105,7 +126,11 @@
 										</v-avatar>
 										<div>
 											<div class="font-weight-medium text-grey-darken-2">
-												{{ item.invoice.customer_name || item.invoice.customer }}
+												{{
+													item.customer_label ||
+													item.invoice.customer_name ||
+													item.invoice.customer
+												}}
 											</div>
 											<div class="text-caption text-grey">{{ __("Customer") }}</div>
 										</div>
@@ -116,6 +141,7 @@
 									<v-chip size="small" color="info" variant="tonal" class="date-chip">
 										<v-icon start size="14">mdi-calendar</v-icon>
 										{{ item.invoice.posting_date }}
+										{{ item.invoice.posting_time }}
 									</v-chip>
 								</template>
 
@@ -133,14 +159,47 @@
 									</div>
 								</template>
 
-								<template #item.actions="{ index }">
+								<template #item.status="{ item }">
+									<strong>{{
+										item.recovery_state === "draft"
+											? __("Draft — submission pending")
+											: item.status
+									}}</strong>
+									<div
+										v-if="item.last_error"
+										class="text-caption"
+										data-test="invoice-sync-error"
+									>
+										{{ item.last_error }}
+									</div>
+									<div class="text-caption">
+										{{ __("Attempts") }}: {{ item.retry_count || 0 }}
+									</div>
+								</template>
+								<template #item.actions="{ item }">
+									<v-btn variant="text" size="small" :disabled="busy" @click="reprintInvoice(item)">{{ __("Reprint receipt") }}</v-btn>
+									<v-btn
+										variant="text"
+										size="small"
+										:disabled="busy || item.status === 'syncing'"
+										@click="reconcileInvoice(item)"
+										>{{ __("Reconcile") }}</v-btn
+									>
+									<v-btn
+										variant="text"
+										size="small"
+										:disabled="busy || item.status === 'syncing'"
+										@click="retryInvoice(item)"
+										>{{ __("Retry") }}</v-btn
+									>
 									<v-btn
 										v-if="posProfile.posa_allow_delete_offline_invoice"
 										icon
 										color="error"
 										size="small"
 										variant="text"
-										@click="removeInvoice(index)"
+										:disabled="busy || item.status !== 'pending' || item.retry_count > 0"
+										@click="removeInvoice(item)"
 										class="delete-btn"
 										:aria-label="__('Delete offline invoice')"
 									>
@@ -196,9 +255,16 @@
 </template>
 
 <script setup>
-import { ref, watch } from "vue";
+import { computed, ref, watch, onUnmounted } from "vue";
 import { formatUtils } from "../format";
-import { getOfflineInvoices, deleteOfflineInvoice, getPendingOfflineInvoiceCount } from "../../offline/index";
+import { reprintOfflineReceipt } from "../services/offlineReceiptPrint";
+import {
+	getInvoiceRecoveryRows,
+	retryInvoiceRecovery,
+	reconcileRecoveryInvoice,
+	deleteUnsentRecoveryInvoice,
+	getPendingOfflineInvoiceCount,
+} from "../../offline/index";
 
 defineOptions({
 	name: "OfflineInvoicesDialog",
@@ -210,6 +276,10 @@ const props = defineProps({
 		type: Object,
 		default: () => ({}),
 	},
+	pendingCount: {
+		type: Number,
+		default: 0,
+	},
 });
 
 const emit = defineEmits(["update:modelValue", "deleted", "sync-all"]);
@@ -219,6 +289,29 @@ const currency_precision = ref(2);
 
 const dialog = ref(props.modelValue);
 const invoices = ref([]);
+const search = ref("");
+const visibleInvoices = computed(() => {
+	const term = String(search.value || "")
+		.trim()
+		.toLowerCase();
+	return invoices.value.filter((row) =>
+		[
+			row.customer_label,
+			row.invoice.customer,
+			row.invoice.customer_name,
+			row.invoice.name,
+			row.request_id,
+			row.status,
+		].some((value) =>
+			String(value || "")
+				.toLowerCase()
+				.includes(term),
+		),
+	);
+});
+const busy = ref(false);
+const operationError = ref("");
+const scope = () => ({ profile: props.posProfile?.name || "", company: props.posProfile?.company });
 const headers = [
 	{
 		title: __("Customer"),
@@ -239,6 +332,11 @@ const headers = [
 		width: "25%",
 	},
 	{
+		title: __("Sync Status"),
+		value: "status",
+		align: "start",
+	},
+	{
 		title: __("Actions"),
 		value: "actions",
 		align: "center",
@@ -248,18 +346,28 @@ const headers = [
 ];
 
 watch(
-	() => props.modelValue,
-	(val) => {
+	() => [props.modelValue, props.posProfile?.name],
+	([val]) => {
 		dialog.value = val;
 		if (val) {
 			loadInvoices();
 		}
 	},
+	{ immediate: true },
 );
 
 watch(dialog, (val) => {
 	emit("update:modelValue", val);
 });
+
+watch(
+	() => props.pendingCount,
+	() => {
+		if (dialog.value) {
+			loadInvoices();
+		}
+	},
+);
 
 function formatCurrency(value, precision) {
 	if (value === null || value === undefined) {
@@ -287,18 +395,75 @@ function currencySymbol(currency) {
 	return get_currency_symbol?.(currency);
 }
 
-function loadInvoices() {
-	invoices.value = getOfflineInvoices();
+let loadVersion = 0;
+async function loadInvoices() {
+	const version = ++loadVersion;
+	try {
+		const rows = await getInvoiceRecoveryRows(scope());
+		if (version === loadVersion) invoices.value = rows;
+	} catch (error) {
+		operationError.value = error?.message || String(error);
+	}
 }
 
-async function removeInvoice(index) {
+async function retryInvoice(item) {
+	busy.value = true;
+	operationError.value = "";
+	try {
+		await retryInvoiceRecovery(item.request_id, scope());
+		await loadInvoices();
+		emit("sync-all");
+	} catch (error) {
+		operationError.value = error?.message || String(error);
+	} finally {
+		busy.value = false;
+	}
+}
+
+async function reprintInvoice(item) {
+	busy.value = true; operationError.value = "";
+	try { await reprintOfflineReceipt(item.request_id, props.posProfile); }
+	catch (error) { operationError.value = error?.message || String(error); }
+	finally { busy.value = false; }
+}
+
+async function reconcileInvoice(item) {
+	busy.value = true;
+	operationError.value = "";
+	try {
+		await reconcileRecoveryInvoice(item.request_id, scope());
+		await loadInvoices();
+		emit("deleted", getPendingOfflineInvoiceCount());
+	} catch (error) {
+		operationError.value = error?.message || String(error);
+	} finally {
+		busy.value = false;
+	}
+}
+
+async function removeInvoice(item) {
 	if (!props.posProfile.posa_allow_delete_offline_invoice) {
 		return;
 	}
-	await deleteOfflineInvoice(index);
-	loadInvoices();
-	emit("deleted", getPendingOfflineInvoiceCount());
+	busy.value = true;
+	operationError.value = "";
+	try {
+		await deleteUnsentRecoveryInvoice(item.request_id, scope());
+		await loadInvoices();
+		emit("deleted", getPendingOfflineInvoiceCount());
+	} catch (error) {
+		operationError.value = error?.message || String(error);
+	} finally {
+		busy.value = false;
+	}
 }
+const refreshTimer = setInterval(() => {
+	if (dialog.value && !busy.value) void loadInvoices();
+}, 3000);
+onUnmounted(() => {
+	loadVersion++;
+	clearInterval(refreshTimer);
+});
 </script>
 
 <style>
@@ -487,32 +652,39 @@ async function removeInvoice(index) {
 	box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2) !important;
 }
 
-/* Header Close Button - Neutral with Red Icon */
+/* Header Close Button */
 .header-close-btn {
 	width: 48px !important;
 	height: 48px !important;
 	border-radius: 12px !important;
-	background: rgba(255, 255, 255, 0.15) !important;
-	border: 1px solid rgba(255, 255, 255, 0.2) !important;
-	color: #f44336 !important;
+	background: rgba(255, 255, 255, 0.16) !important;
+	border: 1px solid rgba(255, 255, 255, 0.42) !important;
+	color: #ffffff !important;
 	transition: all 0.3s ease !important;
 	backdrop-filter: blur(10px);
 }
 
 .header-close-btn:hover {
-	background: rgba(244, 67, 54, 0.1) !important;
-	border-color: rgba(244, 67, 54, 0.3) !important;
+	background: rgba(255, 255, 255, 0.28) !important;
+	border-color: rgba(255, 255, 255, 0.72) !important;
 	transform: scale(1.05) !important;
-	color: #d32f2f !important;
+	color: #ffffff !important;
 }
 
-/* Force red color for the close icon */
 .header-close-btn .v-icon {
-	color: #f44336 !important;
+	display: inline-flex !important;
+	visibility: visible !important;
+	opacity: 1 !important;
+	color: #ffffff !important;
 }
 
 .header-close-btn:hover .v-icon {
-	color: #d32f2f !important;
+	color: #ffffff !important;
+}
+
+.header-close-btn:focus-visible {
+	outline: 3px solid #ffffff !important;
+	outline-offset: 2px;
 }
 
 /* Footer Divider */

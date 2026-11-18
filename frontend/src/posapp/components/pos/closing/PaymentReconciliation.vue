@@ -12,15 +12,16 @@
 		<v-data-table
 			:headers="headers"
 			:items="payments"
-			item-key="mode_of_payment"
+			:item-key="(item) => `${item.mode_of_payment}:${item.currency || ''}`"
 			class="elevation-0 rounded-lg white-table"
 			:items-per-page="itemsPerPage"
 			hide-default-footer
 			density="compact"
 		>
-			<template v-slot:item.closing_amount="props">
+			<template v-slot:item.closing_amount_in_currency="props">
 				<v-text-field
-					v-model="props.item.closing_amount"
+					:model-value="props.item.closing_amount_in_currency"
+					@update:model-value="updateClosingAmount(props.item, $event)"
 					:rules="[closingAmountRule]"
 					:label="$frappe._('Edit')"
 					single-line
@@ -31,12 +32,16 @@
 					color="primary"
 					class="pos-themed-input"
 					hide-details
-					:prefix="companyCurrencySymbol"
+					:prefix="currencySymbol(props.item.currency)"
 				></v-text-field>
 			</template>
-			<template v-slot:item.difference="{ item }">
-				{{ companyCurrencySymbol }}
+			<template v-slot:item.difference_in_currency="{ item }">
+				{{ currencySymbol(item.currency) }}
 				{{ formatCurrency(calculateDifference(item)) }}
+			</template>
+			<template v-slot:item.company_difference="{ item }">
+				{{ companyCurrencySymbol }}
+				{{ formatCurrency(calculateCompanyDifference(item)) }}
 			</template>
 			<template v-slot:item.opening_amount="{ item }">
 				{{ companyCurrencySymbol }}
@@ -50,6 +55,14 @@
 				<span :class="['variance-chip', varianceClass(item)]">
 					{{ formatVariancePercent(item) }}
 				</span>
+			</template>
+			<template v-slot:item.opening_amount_in_currency="{ item }">
+				{{ currencySymbol(item.currency) }}
+				{{ formatCurrency(item.opening_amount_in_currency) }}
+			</template>
+			<template v-slot:item.expected_amount_in_currency="{ item }">
+				{{ currencySymbol(item.currency) }}
+				{{ formatCurrency(item.expected_amount_in_currency) }}
 			</template>
 		</v-data-table>
 	</div>
@@ -66,6 +79,11 @@ const props = defineProps({
 		default: 20,
 	},
 	companyCurrencySymbol: String,
+	companyCurrency: String,
+	currencySymbol: {
+		type: Function,
+		default: () => "",
+	},
 	// Formatters
 	formatCurrency: Function,
 	formatFloat: Function,
@@ -73,6 +91,13 @@ const props = defineProps({
 
 const $frappe = inject("frappe", window.frappe);
 const __ = window.__ || ((t) => t);
+
+const updateClosingAmount = (item, value) => {
+	item.closing_amount_in_currency = value;
+	if (!item.currency || item.currency === props.companyCurrency) {
+		item.closing_amount = value;
+	}
+};
 
 const closingAmountRule = (v) => {
 	if (v === "" || v === null || v === undefined) {
@@ -100,15 +125,22 @@ const closingAmountRule = (v) => {
 };
 
 const calculateDifference = (item) => {
-	const closing = Number(item?.closing_amount) || 0;
-	const expected = Number(item?.expected_amount) || 0;
-	return expected - closing;
+	const closing = Number(item?.closing_amount_in_currency ?? item?.closing_amount) || 0;
+	const expected = Number(item?.expected_amount_in_currency ?? item?.expected_amount) || 0;
+	return closing - expected;
+};
+
+const calculateCompanyDifference = (item) => {
+	const expectedTender = Number(item?.expected_amount_in_currency) || 0;
+	const expectedCompany = Number(item?.expected_amount) || 0;
+	const rate = expectedTender ? Math.abs(expectedCompany / expectedTender) : 1;
+	return calculateDifference(item) * rate;
 };
 
 const formatVariancePercent = (item) => {
-	const expected = Number(item?.expected_amount) || 0;
+	const expected = Number(item?.expected_amount_in_currency ?? item?.expected_amount) || 0;
 	if (!expected) {
-		const closing = Number(item?.closing_amount) || 0;
+		const closing = Number(item?.closing_amount_in_currency ?? item?.closing_amount) || 0;
 		return closing ? __("N/A") : "0%";
 	}
 	const variance = (calculateDifference(item) / expected) * 100;
@@ -117,7 +149,7 @@ const formatVariancePercent = (item) => {
 };
 
 const varianceClass = (item) => {
-	const expected = Number(item?.expected_amount) || 0;
+	const expected = Number(item?.expected_amount_in_currency ?? item?.expected_amount) || 0;
 	if (!expected) {
 		return "variance-neutral";
 	}
@@ -125,7 +157,7 @@ const varianceClass = (item) => {
 	if (!variance) {
 		return "variance-neutral";
 	}
-	return variance > 0 ? "variance-negative" : "variance-positive";
+	return variance < 0 ? "variance-negative" : "variance-positive";
 };
 </script>
 

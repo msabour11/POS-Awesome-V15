@@ -1,4 +1,4 @@
-import { sendRawToQz } from "./qzTray";
+import { prepareQzPrinter, sendRawToQz } from "./qzTray";
 import { parseBooleanSetting } from "../utils/stock";
 
 declare const frappe: any;
@@ -10,6 +10,7 @@ export interface RawDocumentPrintOptions {
 	profile?: Record<string, any> | null;
 	printerName?: string;
 	widthChars?: number;
+	localOnly?: boolean;
 }
 
 const ESC = "\x1B";
@@ -172,6 +173,10 @@ function addHeader(lines: string[], doc: Record<string, any>, options: RawDocume
 	if (company) lines.push(center(company, width));
 	lines.push(center(docTitle(options.doctype), width));
 	lines.push(line(width, "="));
+	if (doc._posa_receipt_label) {
+		lines.push(...wrap(doc._posa_receipt_label, width));
+		lines.push(...wrap(`${translate("Request")}: ${doc.posa_client_request_id || ""}`, width));
+	}
 	lines.push(leftRight(translate("No"), options.name || doc.name, width));
 	const date = [docDate(doc), docTime(doc)].filter(Boolean).join(" ");
 	if (date) lines.push(leftRight(translate("Date"), date, width));
@@ -208,8 +213,33 @@ function addPaymentEntryDetails(lines: string[], doc: Record<string, any>, width
 	if (doc.paid_from) lines.push(leftRight(translate("From"), doc.paid_from, width));
 	if (doc.paid_to) lines.push(leftRight(translate("To"), doc.paid_to, width));
 	if (doc.reference_no) lines.push(leftRight(translate("Reference"), doc.reference_no, width));
-	if (doc.paid_amount !== undefined) lines.push(leftRight(translate("Paid"), formatAmount(doc.paid_amount, doc.paid_from_account_currency || doc.currency), width));
-	if (doc.received_amount !== undefined) lines.push(leftRight(translate("Received"), formatAmount(doc.received_amount, doc.paid_to_account_currency || doc.currency), width));
+	if (doc.posa_payment_currency && doc.posa_original_amount !== undefined) {
+		lines.push(
+			leftRight(
+				translate("Tender"),
+				formatAmount(doc.posa_original_amount, doc.posa_payment_currency),
+				width,
+			),
+		);
+		const settlementAmount =
+			doc.payment_type === "Pay" ? doc.received_amount : doc.paid_amount;
+		const settlementCurrency =
+			doc.payment_type === "Pay"
+				? doc.paid_to_account_currency
+				: doc.paid_from_account_currency;
+		if (settlementAmount !== undefined) {
+			lines.push(
+				leftRight(
+					translate("Settlement"),
+					formatAmount(settlementAmount, settlementCurrency || doc.posa_invoice_currency),
+					width,
+				),
+			);
+		}
+	} else {
+		if (doc.paid_amount !== undefined) lines.push(leftRight(translate("Paid"), formatAmount(doc.paid_amount, doc.paid_from_account_currency || doc.currency), width));
+		if (doc.received_amount !== undefined) lines.push(leftRight(translate("Received"), formatAmount(doc.received_amount, doc.paid_to_account_currency || doc.currency), width));
+	}
 
 	const references = Array.isArray(doc.references) ? doc.references : [];
 	if (!references.length) return;
@@ -258,11 +288,24 @@ function addTotals(lines: string[], doc: Record<string, any>, width: number) {
 	}
 
 	const payments = Array.isArray(doc.payments) ? doc.payments : [];
-	if (!payments.length) return;
-	lines.push(line(width));
-	lines.push(translate("Payments"));
+	if (payments.length) {
+		lines.push(line(width));
+		lines.push(translate("Payments"));
+	}
 	for (const payment of payments) {
-		lines.push(leftRight(payment.mode_of_payment || payment.account || translate("Payment"), formatAmount(paymentAmount(payment), currency), width));
+		const paymentCurrency = payment.posa_payment_currency || currency;
+		const originalAmount = payment.posa_original_amount ?? paymentAmount(payment);
+		lines.push(leftRight(payment.mode_of_payment || payment.account || translate("Payment"), formatAmount(originalAmount, paymentCurrency), width));
+		if (paymentCurrency !== currency) {
+			lines.push(leftRight(`  ${translate("Invoice equivalent")}`, formatAmount(payment.amount, currency), width));
+		}
+	}
+	const changeReturns = Array.isArray(doc.posa_change_returns) ? doc.posa_change_returns : [];
+	if (changeReturns.length) {
+		lines.push(translate("Physical Change Returned"));
+		for (const row of changeReturns) {
+			lines.push(leftRight(row.currency || currency, formatAmount(row.original_amount, row.currency || currency), width));
+		}
 	}
 }
 
@@ -304,6 +347,10 @@ export function buildEscPosDocument(doc: Record<string, any>, options: RawDocume
 }
 
 async function loadDocument(options: RawDocumentPrintOptions) {
+	if (options.localOnly) {
+		if (!options.doc) throw new Error(translate("The local receipt document is missing."));
+		return options.doc;
+	}
 	if (options.name && typeof frappe !== "undefined" && frappe?.call) {
 		try {
 			const response = await frappe.call({
@@ -329,6 +376,11 @@ export async function printRawDocumentViaQz(options: RawDocumentPrintOptions) {
 		throw new Error(translate("Invalid raw print document details."));
 	}
 
+	// Check the local printer before making a document API request so fallback is immediate.
+	const printerName = await prepareQzPrinter(
+		options.printerName || options.profile?.posa_qz_printer_name,
+	);
+
 	const doc = await loadDocument(options);
 	if (!doc) {
 		throw new Error(translate("Unable to load document for raw printing."));
@@ -342,5 +394,5 @@ export async function printRawDocumentViaQz(options: RawDocumentPrintOptions) {
 		},
 		options,
 	);
-	await sendRawToQz(rawData, options.printerName || options.profile?.posa_qz_printer_name);
+	await sendRawToQz(rawData, printerName);
 }
